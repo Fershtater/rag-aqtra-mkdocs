@@ -1,0 +1,559 @@
+"""
+RAG Chain для работы с документацией MkDocs.
+
+Этот модуль содержит функции для загрузки и обработки Markdown документов
+для использования в RAG (Retrieval-Augmented Generation) системе.
+"""
+
+import hashlib
+import logging
+import os
+from pathlib import Path
+from typing import List, Optional
+
+from dotenv import load_dotenv
+from langchain_community.document_loaders import TextLoader
+try:
+    # Для LangChain >= 1.0
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError:
+    # Для LangChain < 1.0
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import FAISS
+try:
+    # Для LangChain >= 1.0
+    from langchain.chains.combine_documents import create_stuff_documents_chain
+    from langchain.chains import create_retrieval_chain
+except ImportError:
+    # Для LangChain < 1.0 или альтернативные импорты
+    try:
+        # Используем альтернативный подход для LangChain 1.x
+        def create_stuff_documents_chain(llm, prompt):
+            def chain(inputs):
+                context = "\n\n".join([doc.page_content for doc in inputs.get("context", [])])
+                return llm.invoke(prompt.format_messages(context=context, input=inputs.get("input", "")))
+            return chain
+        
+        def create_retrieval_chain(retriever, combine_docs_chain):
+            def chain(inputs):
+                docs = retriever.invoke(inputs.get("input", ""))
+                return combine_docs_chain({"context": docs, "input": inputs.get("input", "")})
+            return chain
+    except ImportError:
+        raise ImportError("Не удалось импортировать необходимые модули LangChain")
+
+# Настройка логирования в начале модуля для отладки
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Загружаем переменные окружения из .env файла в начале модуля
+# Это гарантирует, что все функции имеют доступ к переменным окружения
+logger.info("Загрузка переменных окружения из .env файла...")
+env_loaded = load_dotenv()
+if env_loaded:
+    logger.info("✓ Переменные окружения успешно загружены из .env")
+else:
+    logger.warning("⚠ Файл .env не найден или пуст")
+
+
+def load_mkdocs_documents(docs_path: str = "data/mkdocs_docs") -> List[Document]:
+    """
+    Загружает все .md файлы из указанной директории.
+    
+    Использует TextLoader для сохранения исходного формата. Добавляет metadata
+    с source (относительно docs/) для отслеживания источников в RAG.
+    
+    Args:
+        docs_path: Путь к директории с Markdown документами
+        
+    Returns:
+        Список Document объектов с загруженным контентом и metadata
+    """
+    # Преобразуем относительный путь в абсолютный относительно корня проекта
+    project_root = Path(__file__).parent.parent
+    full_docs_path = project_root / docs_path
+    
+    if not full_docs_path.exists():
+        raise ValueError(f"Директория {full_docs_path} не существует")
+    
+    documents = []
+    
+    # Рекурсивно находим все .md файлы
+    md_files = list(full_docs_path.rglob("*.md"))
+    
+    if not md_files:
+        logger.warning(f"Не найдено .md файлов в {full_docs_path}")
+        return documents
+    
+    logger.info(f"Найдено {len(md_files)} Markdown файлов для загрузки...")
+    
+    for md_file in md_files:
+        try:
+            # Используем TextLoader для загрузки файла
+            loader = TextLoader(str(md_file), encoding='utf-8')
+            loaded_docs = loader.load()
+            
+            # Добавляем metadata с source для каждого документа
+            # source должен быть относительно корня документации (docs/...)
+            # для правильного формирования URL в SYSTEM_PROMPT
+            for doc in loaded_docs:
+                # Вычисляем путь относительно корня документации (data/mkdocs_docs)
+                # чтобы получить формат docs/.../file.md
+                relative_path = md_file.relative_to(full_docs_path)
+                # Нормализуем путь (заменяем обратные слеши на прямые для кроссплатформенности)
+                source_path = str(relative_path).replace("\\", "/")
+                doc.metadata["source"] = source_path
+                # Добавляем имя файла для удобства
+                doc.metadata["filename"] = md_file.name
+                # Добавляем полный путь для отладки
+                doc.metadata["full_path"] = str(md_file)
+            
+            documents.extend(loaded_docs)
+            logger.debug(f"Загружен: {md_file.relative_to(project_root)}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при загрузке {md_file}: {e}")
+            continue
+    
+    logger.info(f"Всего загружено документов: {len(documents)}")
+    return documents
+
+
+def chunk_documents(
+    documents: List[Document],
+    chunk_size: int = 1000,
+    chunk_overlap: int = 200
+) -> List[Document]:
+    """
+    Разбивает документы на чанки для векторного поиска.
+    
+    Использует RecursiveCharacterTextSplitter для сохранения семантической целостности.
+    Чанкинг улучшает точность поиска на 30-50% по сравнению с целыми документами,
+    так как каждый чанк получает отдельное векторное представление.
+    
+    Args:
+        documents: Список Document объектов для разбиения
+        chunk_size: Максимальный размер чанка в символах (по умолчанию 1000)
+        chunk_overlap: Количество перекрывающихся символов между чанками (по умолчанию 200)
+        
+    Returns:
+        Список Document объектов, разбитых на чанки с сохранением metadata
+    """
+    if not documents:
+        logger.warning("Получен пустой список документов")
+        return []
+    
+    # Создаем RecursiveCharacterTextSplitter с указанными параметрами
+    # Этот сплиттер оптимален для Markdown, так как:
+    # - Сохраняет структуру (заголовки, параграфы)
+    # - Рекурсивно делит по естественным границам
+    # - Поддерживает overlap для сохранения контекста
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        # Разделители для Markdown (в порядке приоритета)
+        separators=[
+            "\n\n## ",      # Заголовки уровня 2
+            "\n\n### ",     # Заголовки уровня 3
+            "\n\n",         # Параграфы
+            "\n",           # Строки
+            " ",            # Слова
+            ""              # Символы (последний резерв)
+        ],
+        length_function=len,  # Функция для подсчета длины (символы)
+    )
+    
+    logger.info(f"Начинаю разбиение {len(documents)} документов на чанки...")
+    logger.info(f"Параметры: chunk_size={chunk_size}, chunk_overlap={chunk_overlap}")
+    
+    # Разбиваем все документы на чанки
+    # split_documents автоматически сохраняет metadata из исходных документов
+    chunked_documents = text_splitter.split_documents(documents)
+    
+    avg_chunk_size = (
+        sum(len(chunk.page_content) for chunk in chunked_documents) // len(chunked_documents)
+        if chunked_documents else 0
+    )
+    logger.info(f"Создано {len(chunked_documents)} чанков из {len(documents)} документов")
+    logger.info(f"Средний размер чанка: {avg_chunk_size} символов")
+    
+    # Проверяем, что metadata сохранена
+    if chunked_documents and "source" not in chunked_documents[0].metadata:
+        logger.warning("metadata 'source' не найдена в чанках")
+    
+    return chunked_documents
+
+
+def _compute_docs_hash(docs_path: str) -> str:
+    """
+    Вычисляет hash всех .md файлов в директории для проверки устаревания индекса.
+    
+    Args:
+        docs_path: Путь к директории с документами
+        
+    Returns:
+        SHA256 hash всех файлов в виде строки
+    """
+    project_root = Path(__file__).parent.parent
+    full_docs_path = project_root / docs_path
+    
+    if not full_docs_path.exists():
+        return ""
+    
+    md_files = sorted(full_docs_path.rglob("*.md"))
+    hasher = hashlib.sha256()
+    
+    for md_file in md_files:
+        try:
+            with open(md_file, 'rb') as f:
+                hasher.update(f.read())
+                # Также добавляем путь и время модификации
+                hasher.update(str(md_file.relative_to(project_root)).encode())
+                hasher.update(str(md_file.stat().st_mtime).encode())
+        except Exception as e:
+            logger.warning(f"Не удалось прочитать файл {md_file}: {e}")
+    
+    return hasher.hexdigest()
+
+
+def _save_index_hash(index_path: str, docs_hash: str) -> None:
+    """
+    Сохраняет hash документов в файл рядом с индексом.
+    
+    Args:
+        index_path: Путь к директории с индексом
+        docs_hash: Hash документов для сохранения
+    """
+    project_root = Path(__file__).parent.parent
+    full_index_path = project_root / index_path
+    hash_file = full_index_path / ".docs_hash"
+    
+    try:
+        hash_file.parent.mkdir(parents=True, exist_ok=True)
+        hash_file.write_text(docs_hash)
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить hash индекса: {e}")
+
+
+def _load_index_hash(index_path: str) -> Optional[str]:
+    """
+    Загружает сохраненный hash документов.
+    
+    Args:
+        index_path: Путь к директории с индексом
+        
+    Returns:
+        Hash документов или None если файл не найден
+    """
+    project_root = Path(__file__).parent.parent
+    full_index_path = project_root / index_path
+    hash_file = full_index_path / ".docs_hash"
+    
+    if hash_file.exists():
+        try:
+            return hash_file.read_text().strip()
+        except Exception as e:
+            logger.warning(f"Не удалось прочитать hash индекса: {e}")
+    
+    return None
+
+
+def build_or_load_vectorstore(
+    chunks: Optional[List[Document]] = None,
+    index_path: str = "vectorstore/faiss_index",
+    docs_path: str = "data/mkdocs_docs",
+    force_rebuild: bool = False
+):
+    """
+    Создает или загружает векторное хранилище FAISS.
+    
+    FAISS выбран для локального хранения: бесплатный, быстрый, не требует
+    внешних сервисов. Если индекс не существует и chunks=None, автоматически
+    загружает и чанкирует документы. Проверяет устаревание по hash документов.
+    
+    Args:
+        chunks: Список Document объектов для создания индекса.
+                Если None и индекс не существует, автоматически загружает и чанкирует.
+        index_path: Путь к директории с FAISS индексом
+        docs_path: Путь к директории с исходными документами
+        force_rebuild: Если True, пересоздает индекс даже если он существует
+        
+    Returns:
+        FAISS векторное хранилище, готовое к использованию для поиска
+    """
+    # Загружаем переменные окружения из .env файла
+    logger.info("Загрузка переменных окружения для vectorstore...")
+    env_loaded = load_dotenv()
+    if env_loaded:
+        logger.debug("✓ .env файл найден и загружен")
+    else:
+        logger.warning("⚠ .env файл не найден, используем системные переменные окружения")
+    
+    # Получаем API ключ из переменных окружения
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        logger.error("OPENAI_API_KEY не найден в переменных окружения")
+        raise ValueError(
+            "OPENAI_API_KEY не найден в переменных окружения. "
+            "Создайте файл .env с OPENAI_API_KEY=your-key"
+        )
+    logger.info("✓ OPENAI_API_KEY найден в переменных окружения")
+    
+    # Определяем режим разработки (для allow_dangerous_deserialization)
+    # По умолчанию production (безопаснее)
+    env = os.getenv("ENV", "production").lower()
+    is_dev = env == "development"
+    
+    logger.info("=" * 60)
+    logger.info("ВЕКТОРНОЕ ХРАНИЛИЩЕ FAISS")
+    logger.info("=" * 60)
+    
+    # Определяем абсолютный путь к индексу
+    project_root = Path(__file__).parent.parent
+    full_index_path = project_root / index_path
+    
+    # Проверяем существование индекса
+    index_exists = full_index_path.exists() and any(full_index_path.iterdir())
+    
+    # Проверяем устаревание индекса по hash документов
+    index_stale = False
+    if index_exists and not force_rebuild:
+        current_hash = _compute_docs_hash(docs_path)
+        saved_hash = _load_index_hash(index_path)
+        
+        if current_hash and saved_hash:
+            if current_hash != saved_hash:
+                logger.info("Индекс устарел: документы были изменены")
+                index_stale = True
+        elif current_hash and not saved_hash:
+            # Hash не был сохранен ранее, считаем индекс устаревшим
+            logger.info("Hash индекса не найден, пересоздаю индекс")
+            index_stale = True
+    
+    if index_exists and not force_rebuild and not index_stale:
+        logger.info(f"Найден существующий индекс в {index_path}")
+        logger.info("Загружаю индекс из файловой системы...")
+        
+        try:
+            # Инициализируем embeddings (нужны для загрузки индекса)
+            embeddings = OpenAIEmbeddings(
+                model="text-embedding-3-small",
+                openai_api_key=api_key
+            )
+            
+            # Загружаем существующий индекс
+            # allow_dangerous_deserialization только в dev режиме
+            vectorstore = FAISS.load_local(
+                str(full_index_path),
+                embeddings,
+                allow_dangerous_deserialization=is_dev
+            )
+            
+            logger.info("Индекс успешно загружен")
+            logger.info(f"Количество документов в индексе: {vectorstore.index.ntotal}")
+            logger.info("=" * 60)
+            
+            return vectorstore
+            
+        except Exception as e:
+            logger.warning(f"Ошибка при загрузке индекса: {e}")
+            logger.info("Будет создан новый индекс...")
+            index_exists = False
+    
+    # Создаем новый индекс
+    if not index_exists or force_rebuild or index_stale:
+        # Если чанки не предоставлены, автоматически загружаем и чанкируем документы
+        if chunks is None or len(chunks) == 0:
+            logger.info("Чанки не предоставлены, автоматически загружаю документы...")
+            documents = load_mkdocs_documents(docs_path)
+            if not documents:
+                raise ValueError(
+                    f"Не найдено документов в {docs_path}. "
+                    "Убедитесь, что директория содержит .md файлы."
+                )
+            chunks = chunk_documents(documents)
+            logger.info(f"Автоматически загружено и разбито на {len(chunks)} чанков")
+        
+        if force_rebuild:
+            logger.info("Режим force_rebuild: пересоздаю индекс...")
+        elif index_stale:
+            logger.info("Индекс устарел: пересоздаю индекс...")
+        else:
+            logger.info(f"Индекс не найден в {index_path}")
+        
+        logger.info(f"Создаю новый индекс из {len(chunks)} чанков...")
+        
+        # Инициализируем OpenAI Embeddings
+        logger.info("Инициализирую OpenAI Embeddings (text-embedding-3-small)...")
+        embeddings = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            openai_api_key=api_key
+        )
+        
+        # Создаем FAISS векторное хранилище из чанков
+        logger.info("Генерирую embeddings и создаю индекс...")
+        logger.info("(Это может занять несколько минут для большого количества чанков)")
+        
+        vectorstore = FAISS.from_documents(
+            documents=chunks,
+            embedding=embeddings
+        )
+        
+        # Создаем директорию для индекса, если её нет
+        full_index_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Сохраняем индекс на диск
+        logger.info(f"Сохраняю индекс в {index_path}...")
+        vectorstore.save_local(str(full_index_path))
+        
+        # Сохраняем hash документов для проверки устаревания
+        docs_hash = _compute_docs_hash(docs_path)
+        if docs_hash:
+            _save_index_hash(index_path, docs_hash)
+        
+        logger.info("Индекс успешно создан и сохранен")
+        logger.info(f"Количество документов в индексе: {vectorstore.index.ntotal}")
+        logger.info(f"Размерность векторов: {vectorstore.index.d}")
+        logger.info("=" * 60)
+        
+        return vectorstore
+
+
+# System prompt для минимизации hallucinations в RAG
+SYSTEM_PROMPT = """You are an expert assistant that answers questions based solely on the provided context from the documentation.
+
+CRITICAL RULES:
+
+1. RESPOND ONLY BASED ON THE PROVIDED CONTEXT:
+   - Use ONLY the information from the context below
+   - If the answer is not in the context, honestly say "No information about this in the provided context"
+   - DO NOT use your general knowledge if it's not in the context
+
+2. PREVENTING HALLUCINATIONS:
+   - DO NOT invent details that are not in the context
+   - DO NOT add code examples if they are not in the context
+   - DO NOT assume functionality that is not described
+   - DO NOT combine information from different sources unless explicitly stated
+
+3. ACCURACY AND VERIFIABILITY:
+   - Quote exact phrases from the context when important
+   - Indicate if the information may be incomplete
+   - If the context is contradictory, point it out
+
+4. RESPONSE STRUCTURE:
+   - Start with a direct answer to the question
+   - Support the answer with specific details from the context
+   - If necessary, specify the source (file name from metadata)
+   - At the end of every answer, list sources in this format:
+     Sources:
+     • https://docs.aqtra.io/app-development/ui-components/button.html
+     • https://docs.aqtra.io/another/path.html
+     Construct full URLs from metadata['source']: 
+       - Base URL: https://docs.aqtra.io/
+       - Remove 'docs/' prefix and '.md' extension
+       - Replace directory separators with URL paths
+       - Add '.html' at the end
+     Example: metadata['source'] = 'docs/app-development/ui-components/button.md' → https://docs.aqtra.io/app-development/ui-components/button.html
+
+5. IF THE QUESTION IS NOT RELATED TO THE DOCUMENTATION:
+   - Politely redirect to documentation topics
+   - Suggest clarifying the question
+
+6. LANGUAGE RULES:
+   - ALWAYS respond in the same language as the user's question
+   - If the question is in Russian → answer in Russian
+   - If the question is in English → answer in English
+   - If the question is in another language → answer in that language
+   - NEVER mix languages in one answer
+   - If no relevant info: Use equivalent phrase in the user's language (e.g., Russian: «В текущей документации нет информации по этому вопросу»; English: «No information found in the current documentation»)
+
+Remember: it's better to say "I don't know" than to give an inaccurate answer. Your goal is to be a reliable source of information based on the documentation."""
+
+def build_rag_chain(
+    vectorstore,
+    k: int = 4,
+    model: str = "gpt-4o-mini",
+    temperature: float = 0.0
+):
+    """
+    Создает RAG цепочку из готового vectorstore.
+    
+    Использует temperature=0 для детерминированных ответов и минимизации hallucinations.
+    Системный prompt требует отвечать только на основе предоставленного контекста.
+    
+    Args:
+        vectorstore: Готовый FAISS vectorstore
+        k: Количество релевантных чанков для извлечения (по умолчанию 4)
+        model: Модель OpenAI (по умолчанию "gpt-4o-mini")
+        temperature: Температура генерации (0.0 = детерминированная)
+        
+    Returns:
+        RAG цепочка для ответов на вопросы
+    """
+    logger.info(f"Создаю retriever с k={k}...")
+    retriever = vectorstore.as_retriever(search_kwargs={"k": k})
+    
+    logger.info(f"Инициализирую LLM: {model} (temperature={temperature})...")
+    llm = ChatOpenAI(
+        model=model,
+        temperature=temperature,
+        api_key=os.getenv("OPENAI_API_KEY")
+    )
+    
+    logger.info("Создаю prompt template...")
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", SYSTEM_PROMPT),
+        ("human", "Контекст из документации:\n\n{context}\n\nВопрос: {input}")
+    ])
+    
+    logger.info("Создаю Stuff Documents Chain...")
+    document_chain = create_stuff_documents_chain(llm=llm, prompt=prompt)
+    
+    logger.info("Создаю Retrieval Chain...")
+    rag_chain = create_retrieval_chain(
+        retriever=retriever,
+        combine_docs_chain=document_chain
+    )
+    
+    logger.info("RAG цепочка успешно создана")
+    return rag_chain
+
+
+def get_rag_chain(
+    index_path: str = "vectorstore/faiss_index",
+    k: int = 4,
+    model: str = "gpt-4o-mini",
+    temperature: float = 0.0
+):
+    """
+    Создает RAG цепочку, загружая vectorstore и строя chain.
+    
+    Helper функция для обратной совместимости. Использует build_rag_chain().
+    
+    Args:
+        index_path: Путь к директории с FAISS индексом
+        k: Количество релевантных чанков (по умолчанию 4)
+        model: Модель OpenAI (по умолчанию "gpt-4o-mini")
+        temperature: Температура генерации (0.0 = детерминированная)
+        
+    Returns:
+        RAG цепочка для ответов на вопросы
+    """
+    logger.info("=" * 60)
+    logger.info("ИНИЦИАЛИЗАЦИЯ RAG ЦЕПОЧКИ")
+    logger.info("=" * 60)
+    
+    logger.info("Загружаю векторное хранилище...")
+    vectorstore = build_or_load_vectorstore(chunks=None, index_path=index_path)
+    
+    rag_chain = build_rag_chain(vectorstore, k=k, model=model, temperature=temperature)
+    
+    logger.info("=" * 60)
+    return rag_chain
+
