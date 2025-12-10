@@ -13,6 +13,11 @@ from typing import List, Optional
 
 from dotenv import load_dotenv
 from langchain_community.document_loaders import TextLoader
+from app.prompt_config import (
+    PromptSettings,
+    load_prompt_settings_from_env,
+    build_system_prompt
+)
 try:
     # Для LangChain >= 1.0
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -101,7 +106,7 @@ def load_mkdocs_documents(docs_path: str = "data/mkdocs_docs") -> List[Document]
             
             # Добавляем metadata с source для каждого документа
             # source должен быть относительно корня документации (docs/...)
-            # для правильного формирования URL в SYSTEM_PROMPT
+            # для правильного формирования URL в system prompt
             for doc in loaded_docs:
                 # Вычисляем путь относительно корня документации (data/mkdocs_docs)
                 # чтобы получить формат docs/.../file.md
@@ -425,90 +430,56 @@ def build_or_load_vectorstore(
         return vectorstore
 
 
-# System prompt для минимизации hallucinations в RAG
-SYSTEM_PROMPT = """You are an expert assistant that answers questions based solely on the provided context from the documentation.
-
-CRITICAL RULES:
-
-1. RESPOND ONLY BASED ON THE PROVIDED CONTEXT:
-   - Use ONLY the information from the context below
-   - If the answer is not in the context, honestly say "No information about this in the provided context"
-   - DO NOT use your general knowledge if it's not in the context
-
-2. PREVENTING HALLUCINATIONS:
-   - DO NOT invent details that are not in the context
-   - DO NOT add code examples if they are not in the context
-   - DO NOT assume functionality that is not described
-   - DO NOT combine information from different sources unless explicitly stated
-
-3. ACCURACY AND VERIFIABILITY:
-   - Quote exact phrases from the context when important
-   - Indicate if the information may be incomplete
-   - If the context is contradictory, point it out
-
-4. RESPONSE STRUCTURE:
-   - Start with a direct answer to the question
-   - Support the answer with specific details from the context
-   - If necessary, specify the source (file name from metadata)
-   - At the end of every answer, list sources in this format:
-     Sources:
-     • https://docs.aqtra.io/app-development/ui-components/button.html
-     • https://docs.aqtra.io/another/path.html
-     Construct full URLs from metadata['source']: 
-       - Base URL: https://docs.aqtra.io/
-       - Remove 'docs/' prefix and '.md' extension
-       - Replace directory separators with URL paths
-       - Add '.html' at the end
-     Example: metadata['source'] = 'docs/app-development/ui-components/button.md' → https://docs.aqtra.io/app-development/ui-components/button.html
-
-5. IF THE QUESTION IS NOT RELATED TO THE DOCUMENTATION:
-   - Politely redirect to documentation topics
-   - Suggest clarifying the question
-
-6. LANGUAGE RULES:
-   - ALWAYS respond in the same language as the user's question
-   - If the question is in Russian → answer in Russian
-   - If the question is in English → answer in English
-   - If the question is in another language → answer in that language
-   - NEVER mix languages in one answer
-   - If no relevant info: Use equivalent phrase in the user's language (e.g., Russian: «В текущей документации нет информации по этому вопросу»; English: «No information found in the current documentation»)
-
-Remember: it's better to say "I don't know" than to give an inaccurate answer. Your goal is to be a reliable source of information based on the documentation."""
-
 def build_rag_chain(
     vectorstore,
-    k: int = 4,
+    prompt_settings: Optional[PromptSettings] = None,
+    k: Optional[int] = None,
     model: str = "gpt-4o-mini",
-    temperature: float = 0.0
+    temperature: Optional[float] = None
 ):
     """
     Создает RAG цепочку из готового vectorstore.
     
-    Использует temperature=0 для детерминированных ответов и минимизации hallucinations.
-    Системный prompt требует отвечать только на основе предоставленного контекста.
+    Использует настройки из PromptSettings для system prompt и параметров LLM.
     
     Args:
         vectorstore: Готовый FAISS vectorstore
-        k: Количество релевантных чанков для извлечения (по умолчанию 4)
+        prompt_settings: Настройки промпта (если None, загружаются из окружения)
+        k: Количество релевантных чанков (если None, используется из prompt_settings)
         model: Модель OpenAI (по умолчанию "gpt-4o-mini")
-        temperature: Температура генерации (0.0 = детерминированная)
+        temperature: Температура генерации (если None, используется из prompt_settings)
         
     Returns:
         RAG цепочка для ответов на вопросы
     """
-    logger.info(f"Создаю retriever с k={k}...")
-    retriever = vectorstore.as_retriever(search_kwargs={"k": k})
+    # Загружаем настройки, если не переданы
+    if prompt_settings is None:
+        prompt_settings = load_prompt_settings_from_env()
     
-    logger.info(f"Инициализирую LLM: {model} (temperature={temperature})...")
+    # Определяем эффективные значения
+    effective_k = k if k is not None else prompt_settings.default_top_k
+    effective_temperature = temperature if temperature is not None else prompt_settings.default_temperature
+    
+    # Ограничиваем диапазоны
+    effective_k = max(1, min(10, effective_k))
+    effective_temperature = max(0.0, min(1.0, effective_temperature))
+    
+    logger.info(f"Создаю retriever с k={effective_k}...")
+    retriever = vectorstore.as_retriever(search_kwargs={"k": effective_k})
+    
+    logger.info(f"Инициализирую LLM: {model} (temperature={effective_temperature})...")
     llm = ChatOpenAI(
         model=model,
-        temperature=temperature,
+        temperature=effective_temperature,
         api_key=os.getenv("OPENAI_API_KEY")
     )
     
+    # Собираем system prompt из настроек
+    system_prompt = build_system_prompt(prompt_settings)
+    
     logger.info("Создаю prompt template...")
     prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
+        ("system", system_prompt),
         ("human", "Контекст из документации:\n\n{context}\n\nВопрос: {input}")
     ])
     
@@ -527,9 +498,9 @@ def build_rag_chain(
 
 def get_rag_chain(
     index_path: str = "vectorstore/faiss_index",
-    k: int = 4,
+    k: Optional[int] = None,
     model: str = "gpt-4o-mini",
-    temperature: float = 0.0
+    temperature: Optional[float] = None
 ):
     """
     Создает RAG цепочку, загружая vectorstore и строя chain.
@@ -538,9 +509,9 @@ def get_rag_chain(
     
     Args:
         index_path: Путь к директории с FAISS индексом
-        k: Количество релевантных чанков (по умолчанию 4)
+        k: Количество релевантных чанков (если None, используется из настроек)
         model: Модель OpenAI (по умолчанию "gpt-4o-mini")
-        temperature: Температура генерации (0.0 = детерминированная)
+        temperature: Температура генерации (если None, используется из настроек)
         
     Returns:
         RAG цепочка для ответов на вопросы
@@ -556,4 +527,42 @@ def get_rag_chain(
     
     logger.info("=" * 60)
     return rag_chain
+
+
+def build_rag_chain_and_settings(
+    index_path: str = "vectorstore/faiss_index"
+):
+    """
+    Создает RAG цепочку и возвращает настройки промпта.
+    
+    Используется при инициализации приложения для сохранения настроек в app.state.
+    
+    Args:
+        index_path: Путь к директории с FAISS индексом
+        
+    Returns:
+        Кортеж (rag_chain, vectorstore, prompt_settings)
+    """
+    logger.info("=" * 60)
+    logger.info("ИНИЦИАЛИЗАЦИЯ RAG ЦЕПОЧКИ С НАСТРОЙКАМИ")
+    logger.info("=" * 60)
+    
+    logger.info("Загружаю векторное хранилище...")
+    vectorstore = build_or_load_vectorstore(chunks=None, index_path=index_path)
+    
+    logger.info("Загружаю настройки промпта...")
+    prompt_settings = load_prompt_settings_from_env()
+    
+    logger.info(f"Настройки: language={prompt_settings.language}, mode={prompt_settings.mode}, "
+                f"temperature={prompt_settings.default_temperature}, top_k={prompt_settings.default_top_k}")
+    
+    rag_chain = build_rag_chain(
+        vectorstore,
+        prompt_settings=prompt_settings,
+        k=prompt_settings.default_top_k,
+        temperature=prompt_settings.default_temperature
+    )
+    
+    logger.info("=" * 60)
+    return rag_chain, vectorstore, prompt_settings
 

@@ -57,9 +57,11 @@ from pydantic import BaseModel
 from app.rag_chain import (
     build_or_load_vectorstore,
     build_rag_chain,
+    build_rag_chain_and_settings,
     chunk_documents,
     load_mkdocs_documents
 )
+from app.prompt_config import load_prompt_settings_from_env
 
 # Загружаем переменные окружения из .env файла
 load_dotenv()
@@ -92,11 +94,16 @@ logger.info("✓ OPENAI_API_KEY найден в переменных окруж�
 class Query(BaseModel):
     """Модель запроса пользователя."""
     question: str
+    top_k: Optional[int] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
     
     class Config:
         json_schema_extra = {
             "example": {
-                "question": "Как использовать эту функцию?"
+                "question": "Как использовать эту функцию?",
+                "top_k": 4,
+                "temperature": 0.0
             }
         }
 
@@ -146,15 +153,13 @@ async def lifespan(app: FastAPI):
     logger.info("Инициализация RAG цепочки...")
     
     try:
-        # Загружаем vectorstore (автоматически создаст индекс если нужно)
-        vectorstore = build_or_load_vectorstore(chunks=None)
-        
-        # Создаем RAG цепочку из готового vectorstore
-        rag_chain = build_rag_chain(vectorstore)
+        # Загружаем vectorstore и создаем RAG цепочку с настройками
+        rag_chain, vectorstore, prompt_settings = build_rag_chain_and_settings()
         
         # Сохраняем в app.state для доступа из endpoints
         app.state.vectorstore = vectorstore
         app.state.rag_chain = rag_chain
+        app.state.prompt_settings = prompt_settings
         
         logger.info("RAG цепочка готова к использованию")
         logger.info("=" * 60)
@@ -163,6 +168,7 @@ async def lifespan(app: FastAPI):
         logger.error("Приложение запущено, но RAG недоступен")
         app.state.vectorstore = None
         app.state.rag_chain = None
+        app.state.prompt_settings = None
     
     yield
     
@@ -170,6 +176,7 @@ async def lifespan(app: FastAPI):
     logger.info("Остановка приложения...")
     app.state.vectorstore = None
     app.state.rag_chain = None
+    app.state.prompt_settings = None
 
 
 # Создаем FastAPI приложение с lifespan
@@ -216,6 +223,35 @@ async def health_check(request: Request):
     }
 
 
+@app.get("/config/prompt")
+async def get_prompt_config(request: Request):
+    """
+    Возвращает текущие настройки промпта.
+    
+    Returns:
+        JSON с настройками промпта из app.state.prompt_settings
+    """
+    prompt_settings = getattr(request.app.state, "prompt_settings", None)
+    if prompt_settings is None:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "Настройки промпта не загружены",
+                "detail": "RAG цепочка не инициализирована"
+            }
+        )
+    
+    return {
+        "language": prompt_settings.language,
+        "base_docs_url": prompt_settings.base_docs_url,
+        "not_found_message": prompt_settings.not_found_message,
+        "include_sources_in_text": prompt_settings.include_sources_in_text,
+        "mode": prompt_settings.mode,
+        "default_temperature": prompt_settings.default_temperature,
+        "default_top_k": prompt_settings.default_top_k
+    }
+
+
 @app.post("/query", response_model=QueryResponse, responses={503: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
 async def query_documentation(query: Query, request: Request):
     """
@@ -244,6 +280,44 @@ async def query_documentation(query: Query, request: Request):
         )
     
     try:
+        # Получаем настройки промпта из app.state
+        prompt_settings = getattr(request.app.state, "prompt_settings", None)
+        if prompt_settings is None:
+            prompt_settings = load_prompt_settings_from_env()
+        
+        # Вычисляем эффективные значения из запроса или настроек
+        effective_top_k = query.top_k if query.top_k is not None else prompt_settings.default_top_k
+        effective_temperature = query.temperature if query.temperature is not None else prompt_settings.default_temperature
+        
+        # Безопасная валидация диапазонов
+        effective_top_k = max(1, min(10, effective_top_k))
+        effective_temperature = max(0.0, min(1.0, effective_temperature))
+        
+        # Если параметры отличаются от дефолтных, создаем новую цепочку с этими параметрами
+        vectorstore = getattr(request.app.state, "vectorstore", None)
+        if vectorstore is None:
+            logger.error("Vectorstore не найден в app.state")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "Vectorstore не инициализирован",
+                    "detail": "Попробуйте позже или проверьте логи приложения"
+                }
+            )
+        
+        # Если параметры отличаются от дефолтных, создаем временную цепочку
+        if effective_top_k != prompt_settings.default_top_k or effective_temperature != prompt_settings.default_temperature:
+            logger.info(f"Создаю временную цепочку с top_k={effective_top_k}, temperature={effective_temperature}")
+            temp_rag_chain = await asyncio.to_thread(
+                build_rag_chain,
+                vectorstore,
+                prompt_settings=prompt_settings,
+                k=effective_top_k,
+                temperature=effective_temperature
+            )
+            rag_chain = temp_rag_chain
+        # Иначе используем существующую цепочку из app.state
+        
         # Вызываем RAG цепочку с вопросом пользователя асинхронно
         # Используем asyncio.to_thread() для выполнения синхронного invoke() в отдельном потоке
         # Это не блокирует event loop FastAPI
@@ -367,13 +441,22 @@ async def update_index(
             force_rebuild=True
         )
         
+        # Загружаем настройки промпта
+        prompt_settings = load_prompt_settings_from_env()
+        
         # Создаем новую RAG цепочку из уже пересобранного vectorstore
         # (не вызываем get_rag_chain, чтобы избежать повторной загрузки)
-        rag_chain = build_rag_chain(vectorstore)
+        rag_chain = build_rag_chain(
+            vectorstore,
+            prompt_settings=prompt_settings,
+            k=prompt_settings.default_top_k,
+            temperature=prompt_settings.default_temperature
+        )
         
         # Обновляем app.state
         request.app.state.vectorstore = vectorstore
         request.app.state.rag_chain = rag_chain
+        request.app.state.prompt_settings = prompt_settings
         
         logger.info("Индекс успешно обновлен и RAG цепочка пересоздана")
         return {
