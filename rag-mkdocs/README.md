@@ -48,6 +48,14 @@ The service is designed to be **safe**, **transparent**, and **operationally sim
 
 - 🔐 **Safer Defaults** — `ENV=production` by default, dangerous FAISS deserialization disabled outside dev.
 
+- 📊 **Prometheus Metrics** — Built-in observability with `/metrics` endpoint.
+
+- ⚡ **Response Caching** — In-memory LRU cache reduces redundant LLM calls.
+
+- 🛡️ **Rate Limiting** — In-app rate limiting protects against abuse.
+
+- 🔗 **Section Anchors** — Sources include section-level URLs for precise navigation.
+
 ---
 
 ## Who It's For
@@ -255,13 +263,43 @@ Response includes basic stats about documents and chunks.
 
 ---
 
+## Quality Improvements
+
+### Markdown-Aware Chunking
+
+Documents are chunked with awareness of Markdown structure:
+
+- Sections are identified by headers (`#`, `##`, `###`)
+- Chunks preserve section context
+- Each chunk includes metadata: `section_title`, `section_level`, `section_anchor`
+
+### Reranking
+
+The retrieval pipeline uses reranking to improve relevance:
+
+- Base retriever fetches `2x top_k` candidates
+- LLM-based compression filters less relevant chunks
+- Final result contains only the most relevant chunks
+
+### Enhanced Sources
+
+Response sources include:
+
+- `source` - Relative path to document (e.g., `docs/app-development/button.md`)
+- `filename` - Document filename
+- `section_title` - Section header text (if available)
+- `section_anchor` - URL anchor for the section (if available)
+- `url` - Full URL to the documentation page with optional anchor
+
+---
+
 ## API Overview
 
 Once the service is running (default `http://localhost:8000`), the following endpoints are available:
 
 ### `GET /health`
 
-Simple health check endpoint.
+Health check endpoint.
 
 **Response:**
 
@@ -271,6 +309,18 @@ Simple health check endpoint.
   "rag_chain_ready": true
 }
 ```
+
+### `GET /metrics`
+
+Prometheus metrics endpoint.
+
+**Response:**
+
+Plain text in Prometheus format with all service metrics.
+
+### `GET /config/prompt`
+
+Returns current prompt configuration (see [Prompt Configuration](#prompt-configuration) section).
 
 ### `POST /query`
 
@@ -292,11 +342,15 @@ Core RAG endpoint.
   "sources": [
     {
       "source": "docs/app-development/create-app.md",
-      "filename": "create-app.md"
+      "filename": "create-app.md",
+      "section_title": "Creating Your First App",
+      "section_anchor": "creating-your-first-app",
+      "url": "https://docs.aqtra.io/app-development/create-app.html#creating-your-first-app"
     },
     {
       "source": "docs/getting-started/overview.md",
-      "filename": "overview.md"
+      "filename": "overview.md",
+      "url": "https://docs.aqtra.io/getting-started/overview.html"
     }
   ]
 }
@@ -421,6 +475,57 @@ Values outside safe ranges are automatically clamped:
 - `temperature`: clamped to 0.0-1.0
 
 If parameters differ from defaults, a temporary RAG chain is created for the request. This allows fine-tuning retrieval and generation behavior without changing global settings.
+
+---
+
+## Metrics & Monitoring
+
+The service exposes Prometheus metrics at `/metrics` endpoint for monitoring and observability.
+
+### Available Metrics
+
+**Counters:**
+
+- `rag_query_requests_total{status}` - Total number of `/query` requests (labeled by status: success/error)
+- `rag_update_index_requests_total{status}` - Total number of `/update_index` requests
+- `rag_rate_limit_hits_total{endpoint}` - Total number of rate limit hits (labeled by endpoint)
+
+**Histograms:**
+
+- `rag_query_latency_seconds` - Query endpoint latency in seconds
+- `rag_update_index_duration_seconds` - Update index operation duration in seconds
+
+**Gauges:**
+
+- `rag_documents_in_index` - Number of documents in the FAISS index
+- `rag_chunks_in_index` - Number of chunks in the FAISS index
+
+### Correlation IDs
+
+All requests include a correlation ID in the `X-Request-Id` header:
+
+- If provided by the client, it's used as-is
+- Otherwise, a UUID4 is generated automatically
+- The correlation ID is included in all log messages for request tracing
+
+### Rate Limiting
+
+In-app rate limiting is enabled by default:
+
+- `/query`: 30 requests per 60 seconds (configurable via `QUERY_RATE_LIMIT` and `QUERY_RATE_WINDOW_SECONDS`)
+- `/update_index`: 3 requests per hour (configurable via `UPDATE_RATE_LIMIT` and `UPDATE_RATE_WINDOW_SECONDS`)
+
+When rate limit is exceeded, the service returns `429 Too Many Requests` with a clear error message.
+
+### Response Caching
+
+Query responses are cached in-memory with:
+
+- LRU eviction policy
+- TTL: 10 minutes (configurable via `CACHE_TTL_SECONDS`)
+- Max size: 500 entries (configurable via `CACHE_MAX_SIZE`)
+
+Cache key includes: normalized question, `top_k`, `temperature`, and prompt settings signature.
 
 ---
 

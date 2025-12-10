@@ -1,142 +1,162 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Скрипт для проверки состояния векторного индекса
+# Скрипт для проверки состояния индекса и API RAG-ассистента
 # Использование: ./check_index.sh
 
-set -e
+set -euo pipefail
 
-# Цвета
+# Цвета для вывода
+RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-RED='\033[0;31m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+info() {
+    echo -e "${BLUE}[check_index]${NC} $1"
+}
+
+success() {
+    echo -e "${GREEN}[check_index] ✓${NC} $1"
+}
+
+error() {
+    echo -e "${RED}[check_index] ✗${NC} $1" >&2
+}
+
+warning() {
+    echo -e "${YELLOW}[check_index] ⚠${NC} $1"
+}
+
+# Определяем директорию скрипта
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INDEX_PATH="${SCRIPT_DIR}/vectorstore/faiss_index"
+cd "${SCRIPT_DIR}"
 
-echo "=========================================="
-echo "ПРОВЕРКА СОСТОЯНИЯ ВЕКТОРНОГО ИНДЕКСА"
-echo "=========================================="
-echo ""
-
-# 1. Проверка существования директории
-if [ ! -d "$INDEX_PATH" ]; then
-    echo -e "${RED}✗ Директория индекса не найдена: $INDEX_PATH${NC}"
-    echo "  Индекс еще не создан. Запустите: poetry run python update_index.py"
+# Загрузка .env
+if [ -f "${SCRIPT_DIR}/.env" ]; then
+    set -o allexport
+    source "${SCRIPT_DIR}/.env" 2>/dev/null || true
+    set +o allexport
+    info ".env файл загружен"
+else
+    error ".env файл не найден"
+    error "Создайте .env из .env.example и настройте переменные окружения"
     exit 1
 fi
-echo -e "${GREEN}✓ Директория индекса существует${NC}"
 
-# 2. Проверка файлов индекса
-echo ""
-echo "Файлы индекса:"
-if [ -f "${INDEX_PATH}/index.faiss" ]; then
-    SIZE=$(du -h "${INDEX_PATH}/index.faiss" | cut -f1)
-    echo -e "  ${GREEN}✓ index.faiss${NC} (размер: $SIZE)"
-else
-    echo -e "  ${RED}✗ index.faiss не найден${NC}"
+# Установка дефолтов
+PORT="${PORT:-8000}"
+BASE_URL="http://localhost:${PORT}"
+
+# Проверка Poetry
+if ! command -v poetry &> /dev/null; then
+    error "Poetry не найден. Установите: curl -sSL https://install.python-poetry.org | python3 -"
+    exit 1
+fi
+info "Poetry найден: $(poetry --version)"
+
+# Проверка Python
+if ! command -v python3 &> /dev/null && ! poetry run python3 --version &> /dev/null; then
+    error "Python не найден"
+    exit 1
 fi
 
-if [ -f "${INDEX_PATH}/index.pkl" ]; then
-    SIZE=$(du -h "${INDEX_PATH}/index.pkl" | cut -f1)
-    echo -e "  ${GREEN}✓ index.pkl${NC} (размер: $SIZE)"
+echo ""
+info "=========================================="
+info "ПРОВЕРКА ИНДЕКСА И API"
+info "=========================================="
+echo ""
+
+# 1. Пересборка индекса через CLI
+info "Rebuilding index via CLI ..."
+if poetry run python update_index.py; then
+    success "Индекс успешно пересобран"
 else
-    echo -e "  ${RED}✗ index.pkl не найден${NC}"
+    error "Ошибка при пересборке индекса"
+    exit 1
 fi
 
-if [ -f "${INDEX_PATH}/.docs_hash" ]; then
-    HASH=$(cat "${INDEX_PATH}/.docs_hash" | head -1)
-    echo -e "  ${GREEN}✓ .docs_hash${NC} (hash: ${HASH:0:16}...)"
+echo ""
+
+# 2. Проверка /health
+info "Checking /health ..."
+HEALTH_RESPONSE=$(curl -fsS "${BASE_URL}/health" 2>&1)
+if echo "${HEALTH_RESPONSE}" | grep -q '"status"'; then
+    success "/health отвечает корректно"
+    echo "  Response: ${HEALTH_RESPONSE}"
 else
-    echo -e "  ${YELLOW}⚠ .docs_hash не найден${NC} (индекс может быть устаревшим)"
+    error "/health не отвечает корректно"
+    echo "  Response: ${HEALTH_RESPONSE}"
+    exit 1
 fi
 
-# 3. Размер индекса
 echo ""
-TOTAL_SIZE=$(du -sh "${INDEX_PATH}" 2>/dev/null | cut -f1)
-echo "Общий размер индекса: $TOTAL_SIZE"
 
-# 4. Проверка через Python (если возможно)
+# 3. Проверка /config/prompt
+info "Checking /config/prompt ..."
+PROMPT_RESPONSE=$(curl -fsS "${BASE_URL}/config/prompt" 2>&1)
+if echo "${PROMPT_RESPONSE}" | grep -q '"language"'; then
+    success "/config/prompt отвечает корректно"
+    echo "  Response: ${PROMPT_RESPONSE}"
+else
+    error "/config/prompt не отвечает корректно"
+    echo "  Response: ${PROMPT_RESPONSE}"
+    exit 1
+fi
+
 echo ""
-echo "Детальная информация:"
-cd "$SCRIPT_DIR"
 
-if command -v poetry &> /dev/null; then
-    # Инициализация pyenv если нужно
-    if command -v pyenv &> /dev/null; then
-        eval "$(pyenv init -)" 2>/dev/null || true
+# 4. Проверка /metrics
+info "Checking /metrics ..."
+if curl -fsS "${BASE_URL}/metrics" >/dev/null 2>&1; then
+    success "/metrics доступен"
+else
+    error "/metrics недоступен"
+    exit 1
+fi
+
+echo ""
+
+# 5. Проверка /query
+info "Checking /query ..."
+QUERY_RESPONSE=$(curl -fsS "${BASE_URL}/query" \
+    -H "Content-Type: application/json" \
+    -d '{"question": "Как создать приложение в Aqtra?"}' 2>&1)
+
+if echo "${QUERY_RESPONSE}" | grep -q '"answer"'; then
+    success "/query отвечает корректно"
+    # Выводим только начало ответа для краткости
+    ANSWER=$(echo "${QUERY_RESPONSE}" | grep -o '"answer":"[^"]*' | head -1 | cut -d'"' -f4)
+    if [ -n "${ANSWER}" ]; then
+        echo "  Answer preview: ${ANSWER:0:100}..."
     fi
-    
-    # Попытка загрузить индекс и получить информацию
-    python_code='
-import sys
-from pathlib import Path
-
-index_path = Path("vectorstore/faiss_index")
-if not index_path.exists():
-    print("  ✗ Индекс не найден")
-    sys.exit(1)
-
-try:
-    from langchain_community.vectorstores import FAISS
-    from langchain_openai import OpenAIEmbeddings
-    from dotenv import load_dotenv
-    import os
-    
-    load_dotenv()
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("  ⚠ OPENAI_API_KEY не найден, пропускаю проверку загрузки")
-        sys.exit(0)
-    
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=api_key)
-    is_dev = os.getenv("ENV", "development").lower() == "development"
-    
-    vectorstore = FAISS.load_local(
-        str(index_path),
-        embeddings,
-        allow_dangerous_deserialization=is_dev
-    )
-    
-    print(f"  ✓ Индекс успешно загружен")
-    print(f"  ✓ Количество документов: {vectorstore.index.ntotal}")
-    print(f"  ✓ Размерность векторов: {vectorstore.index.d}")
-    print(f"  ✓ Индекс валиден и готов к использованию")
-except Exception as e:
-    print(f"  ⚠ Не удалось загрузить индекс для проверки: {e}")
-    print("  (Это нормально, если API ключ не настроен)")
-'
-
-    poetry run python -c "$python_code" 2>&1 || echo "  ⚠ Не удалось проверить индекс через Python"
 else
-    echo "  ⚠ Poetry не найден, пропускаю детальную проверку"
+    error "/query не отвечает корректно"
+    echo "  Response: ${QUERY_RESPONSE}"
+    exit 1
 fi
 
-# 5. Проверка процесса создания
 echo ""
-echo "Процессы создания индекса:"
-if ps aux | grep -E "(update_index|python.*update)" | grep -v grep > /dev/null; then
-    echo -e "  ${YELLOW}⚠ Процесс создания индекса все еще запущен${NC}"
-    ps aux | grep -E "(update_index|python.*update)" | grep -v grep | head -2
+
+# 6. Проверка /update_index (если есть UPDATE_API_KEY)
+if [[ -n "${UPDATE_API_KEY:-}" ]]; then
+    info "Checking /update_index via HTTP ..."
+    UPDATE_RESPONSE=$(curl -fsS "${BASE_URL}/update_index" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: ${UPDATE_API_KEY}" \
+        -d '{}' 2>&1)
+    
+    if echo "${UPDATE_RESPONSE}" | grep -q '"status"'; then
+        success "/update_index отвечает корректно"
+        echo "  Response: ${UPDATE_RESPONSE}"
+    else
+        error "/update_index не отвечает корректно"
+        echo "  Response: ${UPDATE_RESPONSE}"
+        exit 1
+    fi
 else
-    echo -e "  ${GREEN}✓ Процесс создания индекса не запущен (завершен)${NC}"
+    warning "Skipping /update_index HTTP check (no UPDATE_API_KEY)."
 fi
 
-# 6. Итоговый статус
 echo ""
-echo "=========================================="
-if [ -f "${INDEX_PATH}/index.faiss" ] && [ -f "${INDEX_PATH}/index.pkl" ]; then
-    echo -e "${GREEN}✓ ИНДЕКС СОЗДАН И ГОТОВ К ИСПОЛЬЗОВАНИЮ${NC}"
-    echo ""
-    echo "Следующие шаги:"
-    echo "  1. Запустите сервер: poetry run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
-    echo "  2. Или используйте автоматический скрипт: ./debug_launch.sh"
-else
-    echo -e "${RED}✗ ИНДЕКС НЕ СОЗДАН ИЛИ НЕПОЛНЫЙ${NC}"
-    echo ""
-    echo "Запустите создание индекса:"
-    echo "  poetry run python update_index.py"
-fi
-echo "=========================================="
-
+success "All checks passed."

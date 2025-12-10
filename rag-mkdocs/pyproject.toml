@@ -19,6 +19,7 @@ python-dotenv = "1.0.1"
 
 [tool.poetry.group.dev.dependencies]
 requests = "^2.31.0"
+prometheus-client = "^0.20.0"
 
 [build-system]
 requires = ["poetry-core"]

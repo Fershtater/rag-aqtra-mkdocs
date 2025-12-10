@@ -26,8 +26,17 @@ except ImportError:
     from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
+
+from app.markdown_utils import extract_sections, slugify
+from app.openai_utils import get_embeddings_client, get_chat_llm
+
+try:
+    from langchain.retrievers import ContextualCompressionRetriever
+    from langchain.retrievers.document_compressors import LLMChainExtractor
+    RERANKING_AVAILABLE = True
+except ImportError:
+    RERANKING_AVAILABLE = False
 try:
     # Для LangChain >= 1.0
     from langchain.chains.combine_documents import create_stuff_documents_chain
@@ -118,6 +127,8 @@ def load_mkdocs_documents(docs_path: str = "data/mkdocs_docs") -> List[Document]
                 doc.metadata["filename"] = md_file.name
                 # Добавляем полный путь для отладки
                 doc.metadata["full_path"] = str(md_file)
+                # Сохраняем исходный текст для markdown-aware чанкинга
+                doc.metadata["_original_text"] = doc.page_content
             
             documents.extend(loaded_docs)
             logger.debug(f"Загружен: {md_file.relative_to(project_root)}")
@@ -136,11 +147,11 @@ def chunk_documents(
     chunk_overlap: int = 200
 ) -> List[Document]:
     """
-    Разбивает документы на чанки для векторного поиска.
+    Разбивает документы на чанки с учетом структуры Markdown.
     
-    Использует RecursiveCharacterTextSplitter для сохранения семантической целостности.
-    Чанкинг улучшает точность поиска на 30-50% по сравнению с целыми документами,
-    так как каждый чанк получает отдельное векторное представление.
+    Использует markdown-aware подход: сначала разбивает по секциям,
+    затем применяет RecursiveCharacterTextSplitter внутри секций.
+    Добавляет metadata о секциях и якорях.
     
     Args:
         documents: Список Document объектов для разбиения
@@ -154,15 +165,15 @@ def chunk_documents(
         logger.warning("Получен пустой список документов")
         return []
     
-    # Создаем RecursiveCharacterTextSplitter с указанными параметрами
-    # Этот сплиттер оптимален для Markdown, так как:
-    # - Сохраняет структуру (заголовки, параграфы)
-    # - Рекурсивно делит по естественным границам
-    # - Поддерживает overlap для сохранения контекста
+    logger.info(f"Начинаю markdown-aware разбиение {len(documents)} документов на чанки...")
+    logger.info(f"Параметры: chunk_size={chunk_size}, chunk_overlap={chunk_overlap}")
+    
+    all_chunks = []
+    
+    # Создаем RecursiveCharacterTextSplitter для разбиения внутри секций
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-        # Разделители для Markdown (в порядке приоритета)
         separators=[
             "\n\n## ",      # Заголовки уровня 2
             "\n\n### ",     # Заголовки уровня 3
@@ -171,28 +182,50 @@ def chunk_documents(
             " ",            # Слова
             ""              # Символы (последний резерв)
         ],
-        length_function=len,  # Функция для подсчета длины (символы)
+        length_function=len,
     )
     
-    logger.info(f"Начинаю разбиение {len(documents)} документов на чанки...")
-    logger.info(f"Параметры: chunk_size={chunk_size}, chunk_overlap={chunk_overlap}")
+    for doc in documents:
+        text = doc.page_content
+        
+        # Извлекаем секции из Markdown
+        sections = extract_sections(text)
+        
+        if not sections:
+            # Если секций нет, обрабатываем как обычно
+            chunks = text_splitter.split_text(text)
+            for chunk_text in chunks:
+                chunk = Document(
+                    page_content=chunk_text,
+                    metadata=doc.metadata.copy()
+                )
+                all_chunks.append(chunk)
+            continue
+        
+        # Обрабатываем каждую секцию
+        for section_level, section_title, section_content in sections:
+            # Разбиваем секцию на чанки
+            section_chunks = text_splitter.split_text(section_content)
+            
+            for chunk_text in section_chunks:
+                chunk = Document(
+                    page_content=chunk_text,
+                    metadata=doc.metadata.copy()
+                )
+                
+                # Добавляем информацию о секции
+                chunk.metadata["section_title"] = section_title
+                chunk.metadata["section_level"] = section_level
+                chunk.metadata["section_anchor"] = slugify(section_title)
+                
+                # Удаляем служебное поле
+                chunk.metadata.pop("_original_text", None)
+                
+                all_chunks.append(chunk)
     
-    # Разбиваем все документы на чанки
-    # split_documents автоматически сохраняет metadata из исходных документов
-    chunked_documents = text_splitter.split_documents(documents)
-    
-    avg_chunk_size = (
-        sum(len(chunk.page_content) for chunk in chunked_documents) // len(chunked_documents)
-        if chunked_documents else 0
-    )
-    logger.info(f"Создано {len(chunked_documents)} чанков из {len(documents)} документов")
-    logger.info(f"Средний размер чанка: {avg_chunk_size} символов")
-    
-    # Проверяем, что metadata сохранена
-    if chunked_documents and "source" not in chunked_documents[0].metadata:
-        logger.warning("metadata 'source' не найдена в чанках")
-    
-    return chunked_documents
+    logger.info(f"Всего создано чанков: {len(all_chunks)}")
+    logger.info(f"Чанков с секциями: {sum(1 for c in all_chunks if 'section_title' in c.metadata)}")
+    return all_chunks
 
 
 def _compute_docs_hash(docs_path: str) -> str:
@@ -347,10 +380,7 @@ def build_or_load_vectorstore(
         
         try:
             # Инициализируем embeddings (нужны для загрузки индекса)
-            embeddings = OpenAIEmbeddings(
-                model="text-embedding-3-small",
-                openai_api_key=api_key
-            )
+            embeddings = get_embeddings_client()
             
             # Загружаем существующий индекс
             # allow_dangerous_deserialization только в dev режиме
@@ -394,12 +424,11 @@ def build_or_load_vectorstore(
         
         logger.info(f"Создаю новый индекс из {len(chunks)} чанков...")
         
-        # Инициализируем OpenAI Embeddings
+        # Инициализируем OpenAI Embeddings с увеличенным таймаутом для batch операций
         logger.info("Инициализирую OpenAI Embeddings (text-embedding-3-small)...")
-        embeddings = OpenAIEmbeddings(
-            model="text-embedding-3-small",
-            openai_api_key=api_key
-        )
+        from app.openai_utils import OPENAI_BATCH_TIMEOUT
+        embeddings = get_embeddings_client(timeout=OPENAI_BATCH_TIMEOUT)
+        logger.info(f"Использую таймаут {OPENAI_BATCH_TIMEOUT}с для batch операций создания embeddings")
         
         # Создаем FAISS векторное хранилище из чанков
         logger.info("Генерирую embeddings и создаю индекс...")
@@ -435,7 +464,8 @@ def build_rag_chain(
     prompt_settings: Optional[PromptSettings] = None,
     k: Optional[int] = None,
     model: str = "gpt-4o-mini",
-    temperature: Optional[float] = None
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None
 ):
     """
     Создает RAG цепочку из готового vectorstore.
@@ -448,6 +478,7 @@ def build_rag_chain(
         k: Количество релевантных чанков (если None, используется из prompt_settings)
         model: Модель OpenAI (по умолчанию "gpt-4o-mini")
         temperature: Температура генерации (если None, используется из prompt_settings)
+        max_tokens: Максимальное количество токенов (опционально)
         
     Returns:
         RAG цепочка для ответов на вопросы
@@ -464,15 +495,31 @@ def build_rag_chain(
     effective_k = max(1, min(10, effective_k))
     effective_temperature = max(0.0, min(1.0, effective_temperature))
     
-    logger.info(f"Создаю retriever с k={effective_k}...")
-    retriever = vectorstore.as_retriever(search_kwargs={"k": effective_k})
+    # Создаем базовый retriever с увеличенным k для reranking
+    raw_k = max(effective_k * 2, 8)
+    logger.info(f"Создаю базовый retriever с k={raw_k} для reranking...")
+    base_retriever = vectorstore.as_retriever(search_kwargs={"k": raw_k})
     
-    logger.info(f"Инициализирую LLM: {model} (temperature={effective_temperature})...")
-    llm = ChatOpenAI(
-        model=model,
-        temperature=effective_temperature,
-        api_key=os.getenv("OPENAI_API_KEY")
-    )
+    # Применяем reranking через ContextualCompressionRetriever
+    logger.info(f"Инициализирую LLM для reranking: {model} (temperature={effective_temperature})...")
+    llm = get_chat_llm(temperature=effective_temperature, model=model, max_tokens=max_tokens)
+    
+    # Используем LLMChainExtractor для фильтрации менее релевантных чанков
+    if RERANKING_AVAILABLE:
+        try:
+            compressor = LLMChainExtractor.from_llm(llm)
+            retriever = ContextualCompressionRetriever(
+                base_compressor=compressor,
+                base_retriever=base_retriever
+            )
+            logger.info(f"Reranking включен, финальный k={effective_k}")
+        except Exception as e:
+            logger.warning(f"Ошибка при создании reranker: {e}, используем базовый retriever")
+            retriever = vectorstore.as_retriever(search_kwargs={"k": effective_k})
+    else:
+        # Fallback если ContextualCompressionRetriever недоступен
+        logger.info("Reranking недоступен, используем базовый retriever")
+        retriever = vectorstore.as_retriever(search_kwargs={"k": effective_k})
     
     # Собираем system prompt из настроек
     system_prompt = build_system_prompt(prompt_settings)
