@@ -1,8 +1,8 @@
 """
-RAG Chain для работы с документацией MkDocs.
+RAG Chain for working with MkDocs documentation.
 
-Этот модуль содержит функции для загрузки и обработки Markdown документов
-для использования в RAG (Retrieval-Augmented Generation) системе.
+This module contains functions for loading and processing Markdown documents
+for use in a RAG (Retrieval-Augmented Generation) system.
 """
 
 import hashlib
@@ -17,12 +17,13 @@ from app.core.prompt_config import (
     PromptSettings,
     load_prompt_settings_from_env,
     build_system_prompt,
+    detect_response_language,
 )
 try:
-    # Для LangChain >= 1.0
+    # For LangChain >= 1.0
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 except ImportError:
-    # Для LangChain < 1.0
+    # For LangChain < 1.0
     from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
@@ -39,13 +40,13 @@ try:
 except ImportError:
     RERANKING_AVAILABLE = False
 try:
-    # Для LangChain >= 1.0
+    # For LangChain >= 1.0
     from langchain.chains.combine_documents import create_stuff_documents_chain
     from langchain.chains import create_retrieval_chain
 except ImportError:
-    # Для LangChain < 1.0 или альтернативные импорты
+    # For LangChain < 1.0 or alternative imports
     try:
-        # Используем альтернативный подход для LangChain 1.x
+        # Use alternative approach for LangChain 1.x
         def create_stuff_documents_chain(llm, prompt):
             def chain(inputs):
                 context = "\n\n".join([doc.page_content for doc in inputs.get("context", [])])
@@ -58,96 +59,97 @@ except ImportError:
                 return combine_docs_chain({"context": docs, "input": inputs.get("input", "")})
             return chain
     except ImportError:
-        raise ImportError("Не удалось импортировать необходимые модули LangChain")
+        raise ImportError("Failed to import required LangChain modules")
 
-# Настройка логирования в начале модуля для отладки
+# Configure logging at the beginning of the module for debugging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Загружаем переменные окружения из .env файла в начале модуля
-# Это гарантирует, что все функции имеют доступ к переменным окружения
-logger.info("Загрузка переменных окружения из .env файла...")
+# Load environment variables from .env file at the beginning of the module
+# This ensures all functions have access to environment variables
+logger.info("Loading environment variables from .env file...")
 env_loaded = load_dotenv()
 if env_loaded:
-    logger.info("✓ Переменные окружения успешно загружены из .env")
+    logger.info("✓ Environment variables successfully loaded from .env")
 else:
-    logger.warning("⚠ Файл .env не найден или пуст")
+    logger.warning("⚠ .env file not found or empty")
 
-# Параметры чанкинга с поддержкой конфигурации через переменные окружения.
-# Balanced-дефолты оптимизированы для технической документации.
+# Chunking parameters with configuration support via environment variables.
+# Balanced defaults optimized for technical documentation.
 DEFAULT_CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
 DEFAULT_CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
 DEFAULT_MIN_CHUNK_SIZE = int(os.getenv("MIN_CHUNK_SIZE", "200"))
 
-# Управление LLM-based reranking.
+# LLM-based reranking control.
 RERANKING_ENABLED = os.getenv("RERANKING_ENABLED", "0").lower() in ("1", "true", "yes")
 
 
 def load_mkdocs_documents(docs_path: str = "data/mkdocs_docs") -> List[Document]:
     """
-    Загружает все .md файлы из указанной директории.
+    Loads all .md files from the specified directory.
     
-    Использует TextLoader для сохранения исходного формата. Добавляет metadata
-    с source (относительно docs/) для отслеживания источников в RAG.
+    Uses TextLoader to preserve original format. Adds metadata
+    with source (relative to docs/) for tracking sources in RAG.
     
     Args:
-        docs_path: Путь к директории с Markdown документами
+        docs_path: Path to directory with Markdown documents
         
     Returns:
-        Список Document объектов с загруженным контентом и metadata
+        List of Document objects with loaded content and metadata
     """
-    # Преобразуем относительный путь в абсолютный относительно корня проекта
-    project_root = Path(__file__).parent.parent
+    # Convert relative path to absolute path relative to project root
+    # __file__ is in app/core/rag_chain.py, so need to go up 3 levels
+    project_root = Path(__file__).parent.parent.parent
     full_docs_path = project_root / docs_path
     
     if not full_docs_path.exists():
-        raise ValueError(f"Директория {full_docs_path} не существует")
+        raise ValueError(f"Directory {full_docs_path} does not exist")
     
     documents = []
     
-    # Рекурсивно находим все .md файлы
+    # Recursively find all .md files
     md_files = list(full_docs_path.rglob("*.md"))
     
     if not md_files:
-        logger.warning(f"Не найдено .md файлов в {full_docs_path}")
+        logger.warning(f"No .md files found in {full_docs_path}")
         return documents
     
-    logger.info(f"Найдено {len(md_files)} Markdown файлов для загрузки...")
+    logger.info(f"Found {len(md_files)} Markdown files to load...")
     
     for md_file in md_files:
         try:
-            # Используем TextLoader для загрузки файла
+            # Use TextLoader to load file
             loader = TextLoader(str(md_file), encoding='utf-8')
             loaded_docs = loader.load()
             
-            # Добавляем metadata с source для каждого документа
-            # source должен быть относительно корня документации (docs/...)
-            # для правильного формирования URL в system prompt
+            # Add metadata with source for each document
+            # source should be relative to documentation root (docs/...)
+            # for proper URL formation in system prompt
             for doc in loaded_docs:
-                # Вычисляем путь относительно корня документации (data/mkdocs_docs)
-                # чтобы получить формат docs/.../file.md
+                # Calculate path relative to documentation root (data/mkdocs_docs)
+                # to get format docs/.../file.md
                 relative_path = md_file.relative_to(full_docs_path)
-                # Нормализуем путь (заменяем обратные слеши на прямые для кроссплатформенности)
+                # Normalize path (replace backslashes with forward slashes for cross-platform compatibility)
                 source_path = str(relative_path).replace("\\", "/")
                 doc.metadata["source"] = source_path
-                # Добавляем имя файла для удобства
+                # Add filename for convenience
                 doc.metadata["filename"] = md_file.name
-                # Добавляем полный путь для отладки
+                # Add full path for debugging
                 doc.metadata["full_path"] = str(md_file)
-                # Сохраняем исходный текст для markdown-aware чанкинга
+                # Save original text for markdown-aware chunking
                 doc.metadata["_original_text"] = doc.page_content
             
             documents.extend(loaded_docs)
-            logger.debug(f"Загружен: {md_file.relative_to(project_root)}")
+            logger.debug(f"Loaded: {md_file.relative_to(project_root)}")
             
         except Exception as e:
-            logger.error(f"Ошибка при загрузке {md_file}: {e}")
+            logger.error(f"Error loading {md_file}: {e}")
             continue
     
-    logger.info(f"Всего загружено документов: {len(documents)}")
+    logger.info(f"Total documents loaded: {len(documents)}")
     return documents
 
 
@@ -158,33 +160,33 @@ def chunk_documents(
     min_chunk_size: int = DEFAULT_MIN_CHUNK_SIZE,
 ) -> List[Document]:
     """
-    Разбивает документы на чанки с учетом структуры Markdown.
+    Splits documents into chunks considering Markdown structure.
     
-    Использует markdown-aware подход: сначала разбивает по секциям,
-    затем применяет RecursiveCharacterTextSplitter внутри секций.
-    Добавляет metadata о секциях и якорях.
+    Uses markdown-aware approach: first splits by sections,
+    then applies RecursiveCharacterTextSplitter within sections.
+    Adds metadata about sections and anchors.
     
-    Параметры чанкинга могут быть сконфигурированы через переменные окружения:
-    - CHUNK_SIZE (по умолчанию 1500)
-    - CHUNK_OVERLAP (по умолчанию 300)
-    - MIN_CHUNK_SIZE (по умолчанию 200)
+    Chunking parameters can be configured via environment variables:
+    - CHUNK_SIZE (default 1500)
+    - CHUNK_OVERLAP (default 300)
+    - MIN_CHUNK_SIZE (default 200)
     
     Args:
-        documents: Список Document объектов для разбиения
-        chunk_size: Максимальный размер чанка в символах
-        chunk_overlap: Количество перекрывающихся символов между чанками
-        min_chunk_size: Минимальный допустимый размер чанка; более мелкие отбрасываются
+        documents: List of Document objects to split
+        chunk_size: Maximum chunk size in characters
+        chunk_overlap: Number of overlapping characters between chunks
+        min_chunk_size: Minimum allowed chunk size; smaller chunks are discarded
         
     Returns:
-        Список Document объектов, разбитых на чанки с сохранением metadata
+        List of Document objects split into chunks with preserved metadata
     """
     if not documents:
-        logger.warning("Получен пустой список документов")
+        logger.warning("Received empty document list")
         return []
     
-    logger.info(f"Начинаю markdown-aware разбиение {len(documents)} документов на чанки...")
+    logger.info(f"Starting markdown-aware splitting of {len(documents)} documents into chunks...")
     logger.info(
-        "Параметры чанкинга: chunk_size=%s, chunk_overlap=%s, min_chunk_size=%s",
+        "Chunking parameters: chunk_size=%s, chunk_overlap=%s, min_chunk_size=%s",
         chunk_size,
         chunk_overlap,
         min_chunk_size,
@@ -192,23 +194,23 @@ def chunk_documents(
     
     all_chunks = []
     
-    # Создаем RecursiveCharacterTextSplitter для разбиения внутри секций.
-    # Список separators подобран так, чтобы максимально сохранять структуру:
-    # - сначала код-блоки и крупные заголовки,
-    # - затем параграфы, строки и предложения.
+    # Create RecursiveCharacterTextSplitter for splitting within sections.
+    # List of separators is chosen to maximize structure preservation:
+    # - first code blocks and large headers,
+    # - then paragraphs, lines and sentences.
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         separators=[
-            "\n\n```",      # Код-блоки
-            "\n\n## ",      # Заголовки уровня 2
-            "\n\n### ",     # Заголовки уровня 3
-            "\n\n#### ",    # Заголовки уровня 4
-            "\n\n",         # Параграфы
-            "\n",           # Строки
-            ". ",           # Предложения
-            " ",            # Слова
-            "",             # Символы (последний резерв)
+            "\n\n```",      # Code blocks
+            "\n\n## ",      # Level 2 headers
+            "\n\n### ",     # Level 3 headers
+            "\n\n#### ",    # Level 4 headers
+            "\n\n",         # Paragraphs
+            "\n",           # Lines
+            ". ",           # Sentences
+            " ",            # Words
+            "",             # Characters (last resort)
         ],
         length_function=len,
         keep_separator=True,
@@ -217,11 +219,11 @@ def chunk_documents(
     for doc in documents:
         text = doc.page_content
         
-        # Извлекаем секции из Markdown
+        # Extract sections from Markdown
         sections = extract_sections(text)
         
         if not sections:
-            # Если секций нет, обрабатываем как обычно
+            # If no sections, process as usual
             chunks = text_splitter.split_text(text)
             for chunk_text in chunks:
                 if len(chunk_text) < min_chunk_size:
@@ -230,14 +232,14 @@ def chunk_documents(
                     page_content=chunk_text,
                     metadata=doc.metadata.copy()
                 )
-                # Удаляем служебное поле, если оно осталось после загрузки
+                # Remove service field if it remained after loading
                 chunk.metadata.pop("_original_text", None)
                 all_chunks.append(chunk)
             continue
         
-        # Обрабатываем каждую секцию
+        # Process each section
         for section_level, section_title, section_content in sections:
-            # Разбиваем секцию на чанки
+            # Split section into chunks
             section_chunks = text_splitter.split_text(section_content)
             
             for chunk_text in section_chunks:
@@ -248,30 +250,30 @@ def chunk_documents(
                     metadata=doc.metadata.copy()
                 )
                 
-                # Добавляем информацию о секции
+                # Add section information
                 chunk.metadata["section_title"] = section_title
                 chunk.metadata["section_level"] = section_level
                 chunk.metadata["section_anchor"] = slugify(section_title)
                 
-                # Удаляем служебное поле
+                # Remove service field
                 chunk.metadata.pop("_original_text", None)
                 
                 all_chunks.append(chunk)
     
-    logger.info(f"Всего создано чанков: {len(all_chunks)}")
-    logger.info(f"Чанков с секциями: {sum(1 for c in all_chunks if 'section_title' in c.metadata)}")
+    logger.info(f"Total chunks created: {len(all_chunks)}")
+    logger.info(f"Chunks with sections: {sum(1 for c in all_chunks if 'section_title' in c.metadata)}")
     return all_chunks
 
 
 def _compute_docs_hash(docs_path: str) -> str:
     """
-    Вычисляет hash всех .md файлов в директории для проверки устаревания индекса.
+    Computes hash of all .md files in directory to check index staleness.
     
     Args:
-        docs_path: Путь к директории с документами
+        docs_path: Path to directory with documents
         
     Returns:
-        SHA256 hash всех файлов в виде строки
+        SHA256 hash of all files as string
     """
     project_root = Path(__file__).parent.parent
     full_docs_path = project_root / docs_path
@@ -286,22 +288,22 @@ def _compute_docs_hash(docs_path: str) -> str:
         try:
             with open(md_file, 'rb') as f:
                 hasher.update(f.read())
-                # Также добавляем путь и время модификации
+                # Also add path and modification time
                 hasher.update(str(md_file.relative_to(project_root)).encode())
                 hasher.update(str(md_file.stat().st_mtime).encode())
         except Exception as e:
-            logger.warning(f"Не удалось прочитать файл {md_file}: {e}")
+            logger.warning(f"Failed to read file {md_file}: {e}")
     
     return hasher.hexdigest()
 
 
 def _save_index_hash(index_path: str, docs_hash: str) -> None:
     """
-    Сохраняет hash документов в файл рядом с индексом.
+    Saves document hash to file next to index.
     
     Args:
-        index_path: Путь к директории с индексом
-        docs_hash: Hash документов для сохранения
+        index_path: Path to directory with index
+        docs_hash: Document hash to save
     """
     project_root = Path(__file__).parent.parent
     full_index_path = project_root / index_path
@@ -311,18 +313,18 @@ def _save_index_hash(index_path: str, docs_hash: str) -> None:
         hash_file.parent.mkdir(parents=True, exist_ok=True)
         hash_file.write_text(docs_hash)
     except Exception as e:
-        logger.warning(f"Не удалось сохранить hash индекса: {e}")
+        logger.warning(f"Failed to save index hash: {e}")
 
 
 def _load_index_hash(index_path: str) -> Optional[str]:
     """
-    Загружает сохраненный hash документов.
+    Loads saved document hash.
     
     Args:
-        index_path: Путь к директории с индексом
+        index_path: Path to directory with index
         
     Returns:
-        Hash документов или None если файл не найден
+        Document hash or None if file not found
     """
     project_root = Path(__file__).parent.parent
     full_index_path = project_root / index_path
@@ -332,7 +334,7 @@ def _load_index_hash(index_path: str) -> Optional[str]:
         try:
             return hash_file.read_text().strip()
         except Exception as e:
-            logger.warning(f"Не удалось прочитать hash индекса: {e}")
+            logger.warning(f"Failed to read index hash: {e}")
     
     return None
 
@@ -344,57 +346,57 @@ def build_or_load_vectorstore(
     force_rebuild: bool = False
 ):
     """
-    Создает или загружает векторное хранилище FAISS.
+    Creates or loads FAISS vector store.
     
-    FAISS выбран для локального хранения: бесплатный, быстрый, не требует
-    внешних сервисов. Если индекс не существует и chunks=None, автоматически
-    загружает и чанкирует документы. Проверяет устаревание по hash документов.
+    FAISS chosen for local storage: free, fast, no external services required.
+    If index doesn't exist and chunks=None, automatically loads and chunks documents.
+    Checks staleness by document hash.
     
     Args:
-        chunks: Список Document объектов для создания индекса.
-                Если None и индекс не существует, автоматически загружает и чанкирует.
-        index_path: Путь к директории с FAISS индексом
-        docs_path: Путь к директории с исходными документами
-        force_rebuild: Если True, пересоздает индекс даже если он существует
+        chunks: List of Document objects for index creation.
+                If None and index doesn't exist, automatically loads and chunks.
+        index_path: Path to directory with FAISS index
+        docs_path: Path to directory with source documents
+        force_rebuild: If True, recreates index even if it exists
         
     Returns:
-        FAISS векторное хранилище, готовое к использованию для поиска
+        FAISS vector store ready for search
     """
-    # Загружаем переменные окружения из .env файла
-    logger.info("Загрузка переменных окружения для vectorstore...")
+    # Load environment variables from .env file
+    logger.info("Loading environment variables for vectorstore...")
     env_loaded = load_dotenv()
     if env_loaded:
-        logger.debug("✓ .env файл найден и загружен")
+        logger.debug("✓ .env file found and loaded")
     else:
-        logger.warning("⚠ .env файл не найден, используем системные переменные окружения")
+        logger.warning("⚠ .env file not found, using system environment variables")
     
-    # Получаем API ключ из переменных окружения
+    # Get API key from environment variables
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        logger.error("OPENAI_API_KEY не найден в переменных окружения")
+        logger.error("OPENAI_API_KEY not found in environment variables")
         raise ValueError(
-            "OPENAI_API_KEY не найден в переменных окружения. "
-            "Создайте файл .env с OPENAI_API_KEY=your-key"
+            "OPENAI_API_KEY not found in environment variables. "
+            "Create .env file with OPENAI_API_KEY=your-key"
         )
-    logger.info("✓ OPENAI_API_KEY найден в переменных окружения")
+    logger.info("✓ OPENAI_API_KEY found in environment variables")
     
-    # Определяем режим разработки (для allow_dangerous_deserialization)
-    # По умолчанию production (безопаснее)
+    # Determine development mode (for allow_dangerous_deserialization)
+    # Default is production (safer)
     env = os.getenv("ENV", "production").lower()
     is_dev = env == "development"
     
     logger.info("=" * 60)
-    logger.info("ВЕКТОРНОЕ ХРАНИЛИЩЕ FAISS")
+    logger.info("FAISS VECTOR STORE")
     logger.info("=" * 60)
     
-    # Определяем абсолютный путь к индексу
+    # Determine absolute path to index
     project_root = Path(__file__).parent.parent
     full_index_path = project_root / index_path
     
-    # Проверяем существование индекса
+    # Check index existence
     index_exists = full_index_path.exists() and any(full_index_path.iterdir())
     
-    # Проверяем устаревание индекса по hash документов
+    # Check index staleness by document hash
     index_stale = False
     if index_exists and not force_rebuild:
         current_hash = _compute_docs_hash(docs_path)
@@ -402,93 +404,93 @@ def build_or_load_vectorstore(
         
         if current_hash and saved_hash:
             if current_hash != saved_hash:
-                logger.info("Индекс устарел: документы были изменены")
+                logger.info("Index is stale: documents were changed")
                 index_stale = True
         elif current_hash and not saved_hash:
-            # Hash не был сохранен ранее, считаем индекс устаревшим
-            logger.info("Hash индекса не найден, пересоздаю индекс")
+            # Hash was not saved before, consider index stale
+            logger.info("Index hash not found, recreating index")
             index_stale = True
     
     if index_exists and not force_rebuild and not index_stale:
-        logger.info(f"Найден существующий индекс в {index_path}")
-        logger.info("Загружаю индекс из файловой системы...")
+        logger.info(f"Found existing index in {index_path}")
+        logger.info("Loading index from filesystem...")
         
         try:
-            # Инициализируем embeddings (нужны для загрузки индекса)
+            # Initialize embeddings (needed for loading index)
             embeddings = get_embeddings_client()
             
-            # Загружаем существующий индекс
-            # allow_dangerous_deserialization только в dev режиме
+            # Load existing index
+            # allow_dangerous_deserialization only in dev mode
             vectorstore = FAISS.load_local(
                 str(full_index_path),
                 embeddings,
                 allow_dangerous_deserialization=is_dev
             )
             
-            logger.info("Индекс успешно загружен")
-            logger.info(f"Количество документов в индексе: {vectorstore.index.ntotal}")
+            logger.info("Index successfully loaded")
+            logger.info(f"Number of documents in index: {vectorstore.index.ntotal}")
             logger.info("=" * 60)
             
             return vectorstore
             
         except Exception as e:
-            logger.warning(f"Ошибка при загрузке индекса: {e}")
-            logger.info("Будет создан новый индекс...")
+            logger.warning(f"Error loading index: {e}")
+            logger.info("Will create new index...")
             index_exists = False
     
-    # Создаем новый индекс
+    # Create new index
     if not index_exists or force_rebuild or index_stale:
-        # Если чанки не предоставлены, автоматически загружаем и чанкируем документы
+        # If chunks not provided, automatically load and chunk documents
         if chunks is None or len(chunks) == 0:
-            logger.info("Чанки не предоставлены, автоматически загружаю документы...")
+            logger.info("Chunks not provided, automatically loading documents...")
             documents = load_mkdocs_documents(docs_path)
             if not documents:
                 raise ValueError(
-                    f"Не найдено документов в {docs_path}. "
-                    "Убедитесь, что директория содержит .md файлы."
+                    f"No documents found in {docs_path}. "
+                    "Make sure directory contains .md files."
                 )
             chunks = chunk_documents(documents)
-            logger.info(f"Автоматически загружено и разбито на {len(chunks)} чанков")
+            logger.info(f"Automatically loaded and split into {len(chunks)} chunks")
         
         if force_rebuild:
-            logger.info("Режим force_rebuild: пересоздаю индекс...")
+            logger.info("force_rebuild mode: recreating index...")
         elif index_stale:
-            logger.info("Индекс устарел: пересоздаю индекс...")
+            logger.info("Index is stale: recreating index...")
         else:
-            logger.info(f"Индекс не найден в {index_path}")
+            logger.info(f"Index not found in {index_path}")
         
-        logger.info(f"Создаю новый индекс из {len(chunks)} чанков...")
+        logger.info(f"Creating new index from {len(chunks)} chunks...")
         
-        # Инициализируем OpenAI Embeddings с увеличенным таймаутом для batch операций
-        logger.info("Инициализирую OpenAI Embeddings (text-embedding-3-small)...")
+        # Initialize OpenAI Embeddings with increased timeout for batch operations
+        logger.info("Initializing OpenAI Embeddings (text-embedding-3-small)...")
         from app.infra.openai_utils import OPENAI_BATCH_TIMEOUT
         embeddings = get_embeddings_client(timeout=OPENAI_BATCH_TIMEOUT)
-        logger.info(f"Использую таймаут {OPENAI_BATCH_TIMEOUT}с для batch операций создания embeddings")
+        logger.info(f"Using timeout {OPENAI_BATCH_TIMEOUT}s for batch embedding operations")
         
-        # Создаем FAISS векторное хранилище из чанков
-        logger.info("Генерирую embeddings и создаю индекс...")
-        logger.info("(Это может занять несколько минут для большого количества чанков)")
+        # Create FAISS vector store from chunks
+        logger.info("Generating embeddings and creating index...")
+        logger.info("(This may take several minutes for large number of chunks)")
         
         vectorstore = FAISS.from_documents(
             documents=chunks,
             embedding=embeddings
         )
         
-        # Создаем директорию для индекса, если её нет
+        # Create directory for index if it doesn't exist
         full_index_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Сохраняем индекс на диск
-        logger.info(f"Сохраняю индекс в {index_path}...")
+        # Save index to disk
+        logger.info(f"Saving index to {index_path}...")
         vectorstore.save_local(str(full_index_path))
         
-        # Сохраняем hash документов для проверки устаревания
+        # Save document hash for staleness checking
         docs_hash = _compute_docs_hash(docs_path)
         if docs_hash:
             _save_index_hash(index_path, docs_hash)
         
-        logger.info("Индекс успешно создан и сохранен")
-        logger.info(f"Количество документов в индексе: {vectorstore.index.ntotal}")
-        logger.info(f"Размерность векторов: {vectorstore.index.d}")
+        logger.info("Index successfully created and saved")
+        logger.info(f"Number of documents in index: {vectorstore.index.ntotal}")
+        logger.info(f"Vector dimension: {vectorstore.index.d}")
         logger.info("=" * 60)
         
         return vectorstore
@@ -498,54 +500,54 @@ def build_rag_chain(
     vectorstore,
     prompt_settings: Optional[PromptSettings] = None,
     k: Optional[int] = None,
-    model: str = "gpt-4o-mini",
+    model: str = "gpt-4o",
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None
 ):
     """
-    Создает RAG цепочку из готового vectorstore.
+    Creates RAG chain from ready vectorstore.
     
-    Использует настройки из PromptSettings для system prompt и параметров LLM.
+    Uses settings from PromptSettings for system prompt and LLM parameters.
     
     Args:
-        vectorstore: Готовый FAISS vectorstore
-        prompt_settings: Настройки промпта (если None, загружаются из окружения)
-        k: Количество релевантных чанков (если None, используется из prompt_settings)
-        model: Модель OpenAI (по умолчанию "gpt-4o-mini")
-        temperature: Температура генерации (если None, используется из prompt_settings)
-        max_tokens: Максимальное количество токенов (опционально)
+        vectorstore: Ready FAISS vectorstore
+        prompt_settings: Prompt settings (if None, loaded from environment)
+        k: Number of relevant chunks (if None, used from prompt_settings)
+        model: OpenAI model (default "gpt-4o-mini")
+        temperature: Generation temperature (if None, used from prompt_settings)
+        max_tokens: Maximum number of tokens (optional)
         
     Returns:
-        RAG цепочка для ответов на вопросы
+        RAG chain for answering questions
     """
-    # Загружаем настройки, если не переданы
+    # Load settings if not provided
     if prompt_settings is None:
         prompt_settings = load_prompt_settings_from_env()
     
-    # Определяем эффективные значения
+    # Determine effective values
     effective_k = k if k is not None else prompt_settings.default_top_k
     effective_temperature = temperature if temperature is not None else prompt_settings.default_temperature
-    # Если max_tokens не передан явно, используем настройку по умолчанию из PromptSettings
+    # If max_tokens not explicitly passed, use default setting from PromptSettings
     effective_max_tokens = max_tokens if max_tokens is not None else prompt_settings.default_max_tokens
 
-    # Ограничиваем диапазоны
+    # Limit ranges
     effective_k = max(1, min(10, effective_k))
     effective_temperature = max(0.0, min(1.0, effective_temperature))
     if effective_max_tokens is not None:
         effective_max_tokens = max(128, min(4096, effective_max_tokens))
 
-    # Создаем базовый retriever
+    # Create base retriever
     if RERANKING_ENABLED:
         raw_k = max(effective_k * 2, 8)
-        logger.info("Создаю базовый retriever с k=%s для reranking...", raw_k)
+        logger.info("Creating base retriever with k=%s for reranking...", raw_k)
         base_retriever = vectorstore.as_retriever(search_kwargs={"k": raw_k})
     else:
-        logger.info("Reranking отключен, используем базовый retriever с k=%s", effective_k)
+        logger.info("Reranking disabled, using base retriever with k=%s", effective_k)
         base_retriever = vectorstore.as_retriever(search_kwargs={"k": effective_k})
 
-    # Применяем reranking через ContextualCompressionRetriever (опционально)
+    # Apply reranking via ContextualCompressionRetriever (optional)
     logger.info(
-        "Инициализирую LLM для retriever: %s (temperature=%s, max_tokens=%s, reranking_enabled=%s)...",
+        "Initializing LLM for retriever: %s (temperature=%s, max_tokens=%s, reranking_enabled=%s)...",
         model,
         effective_temperature,
         effective_max_tokens,
@@ -564,60 +566,48 @@ def build_rag_chain(
                 base_compressor=compressor,
                 base_retriever=base_retriever,
             )
-            logger.info("Reranking включен, финальный k=%s", effective_k)
+            logger.info("Reranking enabled, final k=%s", effective_k)
         except Exception as e:
-            logger.warning("Ошибка при создании reranker: %s, используем базовый retriever", e)
+            logger.warning("Error creating reranker: %s, using base retriever", e)
             retriever = vectorstore.as_retriever(search_kwargs={"k": effective_k})
     else:
         if RERANKING_ENABLED and not RERANKING_AVAILABLE:
-            logger.info("Reranking запрошен, но недоступен в текущей версии LangChain; используем базовый retriever")
+            logger.info("Reranking requested but not available in current LangChain version; using base retriever")
         retriever = vectorstore.as_retriever(search_kwargs={"k": effective_k})
     
-    # Собираем system prompt из настроек
-    system_prompt = build_system_prompt(prompt_settings)
+    # Build system prompt template with {response_language} placeholder
+    # Language will be determined per request and injected at runtime
+    system_prompt_template = build_system_prompt(prompt_settings, response_language="{response_language}")
     
-    # Human-промпт с явной структурой: сначала контекст, затем вопрос и инструкции.
-    if prompt_settings.language == "ru":
-        human_template = (
-            "Контекст из документации (релевантные фрагменты):\n\n"
-            "{context}\n\n"
-            "---\n\n"
-            "Вопрос пользователя: {input}\n\n"
-            "Инструкции:\n"
-            "- Используйте ТОЛЬКО информацию из контекста\n"
-            "- Ответьте максимально понятно и структурированно\n"
-            "- При необходимости приведите примеры и пошаговые действия\n"
-            "- Если информации не хватает, объясните, чего именно не хватает"
-        )
-    else:
-        human_template = (
-            "Documentation context (relevant fragments):\n\n"
-            "{context}\n\n"
-            "---\n\n"
-            "User question: {input}\n\n"
-            "Instructions:\n"
-            "- Use ONLY the information from the context\n"
-            "- Answer as clearly and structurally as possible\n"
-            "- Provide examples and step-by-step instructions when helpful\n"
-            "- If the context is insufficient, explain what exactly is missing"
-        )
+    # Human prompt with explicit structure: context first, then question and instructions.
+    human_template = (
+        "Documentation context (relevant fragments):\n\n"
+        "{context}\n\n"
+        "---\n\n"
+        "User question: {input}\n\n"
+        "Instructions:\n"
+        "- Use ONLY the information from the context\n"
+        "- Answer as clearly and structurally as possible\n"
+        "- Provide examples and step-by-step instructions when helpful\n"
+        "- If the context is insufficient, explain what exactly is missing"
+    )
 
-    logger.info("Создаю prompt template...")
+    logger.info("Creating prompt template...")
     prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
+        ("system", system_prompt_template),
         ("human", human_template),
     ])
     
-    logger.info("Создаю Stuff Documents Chain...")
+    logger.info("Creating Stuff Documents Chain...")
     document_chain = create_stuff_documents_chain(llm=llm, prompt=prompt)
     
-    logger.info("Создаю Retrieval Chain...")
+    logger.info("Creating Retrieval Chain...")
     rag_chain = create_retrieval_chain(
         retriever=retriever,
         combine_docs_chain=document_chain
     )
     
-    logger.info("RAG цепочка успешно создана")
+    logger.info("RAG chain successfully created")
     return rag_chain
 
 
@@ -628,24 +618,24 @@ def get_rag_chain(
     temperature: Optional[float] = None
 ):
     """
-    Создает RAG цепочку, загружая vectorstore и строя chain.
+    Creates RAG chain by loading vectorstore and building chain.
     
-    Helper функция для обратной совместимости. Использует build_rag_chain().
+    Helper function for backward compatibility. Uses build_rag_chain().
     
     Args:
-        index_path: Путь к директории с FAISS индексом
-        k: Количество релевантных чанков (если None, используется из настроек)
-        model: Модель OpenAI (по умолчанию "gpt-4o-mini")
-        temperature: Температура генерации (если None, используется из настроек)
+        index_path: Path to directory with FAISS index
+        k: Number of relevant chunks (if None, used from settings)
+        model: OpenAI model (default "gpt-4o-mini")
+        temperature: Generation temperature (if None, used from settings)
         
     Returns:
-        RAG цепочка для ответов на вопросы
+        RAG chain for answering questions
     """
     logger.info("=" * 60)
-    logger.info("ИНИЦИАЛИЗАЦИЯ RAG ЦЕПОЧКИ")
+    logger.info("RAG CHAIN INITIALIZATION")
     logger.info("=" * 60)
     
-    logger.info("Загружаю векторное хранилище...")
+    logger.info("Loading vector store...")
     vectorstore = build_or_load_vectorstore(chunks=None, index_path=index_path)
     
     rag_chain = build_rag_chain(vectorstore, k=k, model=model, temperature=temperature)
@@ -658,28 +648,28 @@ def build_rag_chain_and_settings(
     index_path: str = "vectorstore/faiss_index"
 ):
     """
-    Создает RAG цепочку и возвращает настройки промпта.
+    Creates RAG chain and returns prompt settings.
     
-    Используется при инициализации приложения для сохранения настроек в app.state.
+    Used during application initialization to save settings in app.state.
     
     Args:
-        index_path: Путь к директории с FAISS индексом
+        index_path: Path to directory with FAISS index
         
     Returns:
-        Кортеж (rag_chain, vectorstore, prompt_settings)
+        Tuple (rag_chain, vectorstore, prompt_settings)
     """
     logger.info("=" * 60)
-    logger.info("ИНИЦИАЛИЗАЦИЯ RAG ЦЕПОЧКИ С НАСТРОЙКАМИ")
+    logger.info("RAG CHAIN INITIALIZATION WITH SETTINGS")
     logger.info("=" * 60)
     
-    logger.info("Загружаю векторное хранилище...")
+    logger.info("Loading vector store...")
     vectorstore = build_or_load_vectorstore(chunks=None, index_path=index_path)
     
-    logger.info("Загружаю настройки промпта...")
+    logger.info("Loading prompt settings...")
     prompt_settings = load_prompt_settings_from_env()
     
-    logger.info(f"Настройки: language={prompt_settings.language}, mode={prompt_settings.mode}, "
-                f"temperature={prompt_settings.default_temperature}, top_k={prompt_settings.default_top_k}")
+    logger.info(f"Settings: supported_languages={prompt_settings.supported_languages}, fallback={prompt_settings.fallback_language}, "
+                f"mode={prompt_settings.mode}, temperature={prompt_settings.default_temperature}, top_k={prompt_settings.default_top_k}")
     
     rag_chain = build_rag_chain(
         vectorstore,

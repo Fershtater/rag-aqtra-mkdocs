@@ -1,5 +1,5 @@
 """
-Метрики Prometheus для мониторинга RAG-сервиса.
+Prometheus metrics for RAG service monitoring.
 """
 
 import logging
@@ -12,11 +12,11 @@ try:
 except ImportError:
     PROMETHEUS_AVAILABLE = False
     logger = logging.getLogger(__name__)
-    logger.warning("prometheus_client не установлен, метрики недоступны")
+    logger.warning("prometheus_client not installed, metrics unavailable")
 
-# Инициализация метрик (только если Prometheus доступен)
+# Initialize metrics (only if Prometheus is available)
 if PROMETHEUS_AVAILABLE:
-    # Счетчики
+    # Counters
     query_requests_total = Counter(
         'rag_query_requests_total',
         'Total number of /query requests',
@@ -35,7 +35,7 @@ if PROMETHEUS_AVAILABLE:
         ['endpoint']  # query, update_index
     )
     
-    # Гистограммы (latency)
+    # Histograms (latency)
     query_latency_seconds = Histogram(
         'rag_query_latency_seconds',
         'Query endpoint latency in seconds',
@@ -59,7 +59,7 @@ if PROMETHEUS_AVAILABLE:
         'Number of chunks in the FAISS index'
     )
 else:
-    # Заглушки для случая, когда Prometheus недоступен
+    # Stubs for when Prometheus is unavailable
     query_requests_total = None
     update_index_requests_total = None
     rate_limit_hits_total = None
@@ -70,14 +70,14 @@ else:
 
 
 def get_metrics_response():
-    """Возвращает метрики в формате Prometheus."""
+    """Returns metrics in Prometheus format."""
     if not PROMETHEUS_AVAILABLE:
         return "Prometheus client not available", "text/plain"
     return generate_latest(), CONTENT_TYPE_LATEST
 
 
 def update_index_metrics(documents_count: int, chunks_count: int):
-    """Обновляет метрики индекса."""
+    """Updates index metrics."""
     if PROMETHEUS_AVAILABLE and documents_in_index is not None:
         documents_in_index.set(documents_count)
         chunks_in_index.set(chunks_count)

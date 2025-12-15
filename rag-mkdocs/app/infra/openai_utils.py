@@ -1,7 +1,7 @@
 """
-Утилиты для работы с OpenAI API.
+Utilities for working with OpenAI API.
 
-Централизованный error handling, таймауты и retry логика.
+Centralized error handling, timeouts and retry logic.
 """
 
 import logging
@@ -13,11 +13,11 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 
 logger = logging.getLogger(__name__)
 
-# Настройки таймаутов (в секундах)
+# Timeout settings (in seconds)
 OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "30"))
-# Таймаут для LLM запросов (Chat API) - по умолчанию 2 минуты для больших контекстов
+# Timeout for LLM requests (Chat API) - default 2 minutes for large contexts
 OPENAI_LLM_TIMEOUT = int(os.getenv("OPENAI_LLM_TIMEOUT", "120"))
-# Таймаут для batch операций (создание индекса) - по умолчанию 5 минут
+# Timeout for batch operations (index creation) - default 5 minutes
 OPENAI_BATCH_TIMEOUT = int(os.getenv("OPENAI_BATCH_TIMEOUT", "300"))
 OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
 OPENAI_RETRY_BACKOFF_BASE = float(os.getenv("OPENAI_RETRY_BACKOFF_BASE", "1.5"))
@@ -25,14 +25,14 @@ OPENAI_RETRY_BACKOFF_BASE = float(os.getenv("OPENAI_RETRY_BACKOFF_BASE", "1.5"))
 
 def get_embeddings_client(timeout: Optional[int] = None) -> OpenAIEmbeddings:
     """
-    Создает клиент для OpenAI embeddings с настройками таймаутов.
+    Creates client for OpenAI embeddings with timeout settings.
     
     Args:
-        timeout: Таймаут в секундах. Если не указан, используется OPENAI_TIMEOUT.
-                 Для batch операций используйте OPENAI_BATCH_TIMEOUT или передайте явно.
+        timeout: Timeout in seconds. If not specified, OPENAI_TIMEOUT is used.
+                 For batch operations use OPENAI_BATCH_TIMEOUT or pass explicitly.
     
     Returns:
-        OpenAIEmbeddings клиент
+        OpenAIEmbeddings client
     """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -56,16 +56,16 @@ def get_chat_llm(
     timeout: Optional[int] = None
 ) -> ChatOpenAI:
     """
-    Создает клиент для OpenAI Chat API с настройками таймаутов.
+    Creates client for OpenAI Chat API with timeout settings.
     
     Args:
-        temperature: Температура генерации
-        model: Модель OpenAI
-        max_tokens: Максимальное количество токенов (опционально)
-        timeout: Таймаут в секундах. Если не указан, используется OPENAI_LLM_TIMEOUT.
+        temperature: Generation temperature
+        model: OpenAI model
+        max_tokens: Maximum number of tokens (optional)
+        timeout: Timeout in seconds. If not specified, OPENAI_LLM_TIMEOUT is used.
         
     Returns:
-        ChatOpenAI клиент
+        ChatOpenAI client
     """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -96,20 +96,20 @@ def with_retries(
     **kwargs
 ) -> Any:
     """
-    Выполняет функцию с экспоненциальным backoff при ошибках.
+    Executes function with exponential backoff on errors.
     
     Args:
-        fn: Функция для выполнения
-        *args: Позиционные аргументы
-        max_retries: Максимальное количество попыток
-        backoff_base: База для экспоненциального backoff
-        **kwargs: Именованные аргументы
+        fn: Function to execute
+        *args: Positional arguments
+        max_retries: Maximum number of attempts
+        backoff_base: Base for exponential backoff
+        **kwargs: Named arguments
         
     Returns:
-        Результат выполнения функции
+        Function execution result
         
     Raises:
-        Последнее исключение, если все попытки исчерпаны
+        Last exception if all attempts exhausted
     """
     last_exception = None
     
@@ -121,13 +121,13 @@ def with_retries(
             if attempt < max_retries - 1:
                 wait_time = backoff_base ** attempt
                 logger.warning(
-                    f"Ошибка при вызове {fn.__name__} (попытка {attempt + 1}/{max_retries}): {e}. "
-                    f"Повтор через {wait_time:.2f}с"
+                    f"Error calling {fn.__name__} (attempt {attempt + 1}/{max_retries}): {e}. "
+                    f"Retrying after {wait_time:.2f}s"
                 )
                 time.sleep(wait_time)
             else:
                 logger.error(
-                    f"Все попытки исчерпаны для {fn.__name__}: {e}",
+                    f"All attempts exhausted for {fn.__name__}: {e}",
                     exc_info=True
                 )
     

@@ -1,8 +1,8 @@
-# ВАЖНО: Эти версии имеют конфликты зависимостей!
-# Используйте Poetry для установки: poetry install
-# Poetry автоматически разрешит совместимые версии
+# IMPORTANT: These versions have dependency conflicts!
+# Use Poetry for installation: poetry install
+# Poetry will automatically resolve compatible versions
 
-# Совместимые версии (установлены через Poetry):
+# Compatible versions (installed via Poetry):
 langchain>=0.2.0,<0.3.0
 langchain-openai>=0.1.0,<0.2.0
 langchain-community>=0.2.0,<0.3.0

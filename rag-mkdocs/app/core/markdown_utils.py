@@ -1,7 +1,7 @@
 """
-Утилиты для работы с Markdown документами.
+Utilities for working with Markdown documents.
 
-Функции для извлечения секций, якорей и улучшенного чанкинга.
+Functions for extracting sections, anchors and improved chunking.
 """
 
 import re
@@ -10,13 +10,13 @@ from typing import List, Tuple, Optional
 
 def extract_sections(text: str) -> List[Tuple[int, str, str]]:
     """
-    Извлекает секции из Markdown текста.
+    Extracts sections from Markdown text.
     
     Args:
-        text: Markdown текст
+        text: Markdown text
         
     Returns:
-        Список кортежей (уровень, заголовок, содержимое_секции)
+        List of tuples (level, title, section_content)
     """
     sections = []
     lines = text.split('\n')
@@ -25,10 +25,10 @@ def extract_sections(text: str) -> List[Tuple[int, str, str]]:
     current_section_content = []
     
     for line in lines:
-        # Проверяем, является ли строка заголовком
+        # Check if line is a header
         header_match = re.match(r'^(#{1,6})\s+(.+)$', line)
         if header_match:
-            # Сохраняем предыдущую секцию, если она есть
+            # Save previous section if it exists
             if current_section_content:
                 sections.append((
                     current_section_level,
@@ -36,14 +36,14 @@ def extract_sections(text: str) -> List[Tuple[int, str, str]]:
                     '\n'.join(current_section_content)
                 ))
             
-            # Начинаем новую секцию
+            # Start new section
             current_section_level = len(header_match.group(1))
             current_section_title = header_match.group(2).strip()
             current_section_content = []
         else:
             current_section_content.append(line)
     
-    # Добавляем последнюю секцию
+    # Add last section
     if current_section_content:
         sections.append((
             current_section_level,
@@ -56,33 +56,33 @@ def extract_sections(text: str) -> List[Tuple[int, str, str]]:
 
 def slugify(text: str) -> str:
     """
-    Преобразует текст в slug для якорей.
+    Converts text to slug for anchors.
     
     Args:
-        text: Текст заголовка
+        text: Header text
         
     Returns:
-        Slug (например, "app-development" из "App Development")
+        Slug (e.g., "app-development" from "App Development")
     """
-    # Приводим к нижнему регистру
+    # Convert to lowercase
     text = text.lower()
-    # Заменяем пробелы и специальные символы на дефисы
+    # Replace spaces and special characters with hyphens
     text = re.sub(r'[^\w\s-]', '', text)
     text = re.sub(r'[-\s]+', '-', text)
-    # Убираем дефисы в начале и конце
+    # Remove hyphens at start and end
     return text.strip('-')
 
 
 def find_section_for_text(text: str, position: int) -> Tuple[Optional[str], Optional[int], Optional[str]]:
     """
-    Находит секцию, к которой относится текст на указанной позиции.
+    Finds section that text at specified position belongs to.
     
     Args:
-        text: Полный текст документа
-        position: Позиция в тексте
+        text: Full document text
+        position: Position in text
         
     Returns:
-        Кортеж (заголовок, уровень, anchor) или (None, None, None)
+        Tuple (title, level, anchor) or (None, None, None)
     """
     sections = extract_sections(text)
     current_pos = 0
@@ -97,46 +97,46 @@ def find_section_for_text(text: str, position: int) -> Tuple[Optional[str], Opti
         if section_start <= position <= section_end:
             return title, level, slugify(title)
         
-        # Обновляем последнюю встреченную секцию
-        if level <= (last_level or 999):  # Более высокий уровень заголовка
+        # Update last encountered section
+        if level <= (last_level or 999):  # Higher header level
             last_title = title
             last_level = level
             last_anchor = slugify(title)
         
-        current_pos = section_end + len(title) + level + 2  # +2 для "# " и "\n"
+        current_pos = section_end + len(title) + level + 2  # +2 for "# " and "\n"
     
     return last_title, last_level, last_anchor
 
 
 def build_doc_url(base_url: str, source: str, section_anchor: Optional[str] = None) -> str:
     """
-    Строит полный URL документа с опциональным якорем секции.
+    Builds full document URL with optional section anchor.
     
     Args:
-        base_url: Базовый URL документации (например, "https://docs.aqtra.io/")
-        source: Путь к файлу относительно docs/ (например, "docs/app-development/button.md")
-        section_anchor: Якорь секции (например, "primary-button") или None
+        base_url: Base documentation URL (e.g., "https://docs.aqtra.io/")
+        source: File path relative to docs/ (e.g., "docs/app-development/button.md")
+        section_anchor: Section anchor (e.g., "primary-button") or None
         
     Returns:
-        Полный URL (например, "https://docs.aqtra.io/app-development/button.html#primary-button")
+        Full URL (e.g., "https://docs.aqtra.io/app-development/button.html#primary-button")
     """
-    # Убираем префикс docs/ если есть
+    # Remove docs/ prefix if present
     if source.startswith("docs/"):
-        path = source[5:]  # Убираем "docs/"
+        path = source[5:]  # Remove "docs/"
     else:
         path = source
     
-    # Убираем .md
+    # Remove .md
     if path.endswith(".md"):
         path = path[:-3]
     
-    # Заменяем разделители на /
+    # Replace separators with /
     path = path.replace("\\", "/")
     
-    # Собираем URL
+    # Build URL
     url = f"{base_url.rstrip('/')}/{path}.html"
     
-    # Добавляем якорь если есть
+    # Add anchor if present
     if section_anchor:
         url += f"#{section_anchor}"
     

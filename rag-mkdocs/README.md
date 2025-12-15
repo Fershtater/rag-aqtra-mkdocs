@@ -82,32 +82,36 @@ Deploy and monitor a small, self-contained service: single FastAPI app, local FA
 
 At a high level, the service consists of:
 
-- **FastAPI application** (`app/main.py`)
+- **FastAPI application** (`app/api/main.py`)
 
   - `/health` — health check endpoint
-
   - `/query` — RAG question-answering endpoint
-
   - `/update_index` — authenticated index rebuild endpoint
+  - `/config/prompt` — current prompt configuration
+  - `/metrics` — Prometheus metrics endpoint
+  - `/escalate` — escalation endpoint to Zoho Desk (for “not found” answers)
 
-- **RAG pipeline** (`app/rag_chain.py`)
+- **RAG pipeline** (`app/core/rag_chain.py`)
 
   - Loads `.md` files from `data/mkdocs_docs/docs/…`
-
-  - Splits documents into overlapping chunks
-
+  - Splits documents into overlapping chunks (Markdown-aware)
   - Embeds chunks with OpenAI embeddings
-
   - Stores vectors in a local FAISS index
-
   - Builds a LangChain retrieval + generation chain (`retriever` + `ChatOpenAI`)
+
+- **Infrastructure layer** (`app/infra/…`)
+
+  - `openai_utils.py` — OpenAI clients, timeouts and retries
+  - `cache.py` — in-memory LRU/TTL response cache
+  - `rate_limit.py` — in-memory rate limiting for `/query`, `/update_index`, `/escalate`
+  - `metrics.py` — Prometheus metrics wiring
+  - `db.py`, `models.py`, `analytics.py` — Postgres logging for queries and escalations
+  - `zoho_desk.py` — Zoho Desk integration for escalation tickets
 
 - **Vector store**
 
-  - Stored under `vectorstore/faiss_index`
-
+  - Stored under `vectorstore/faiss_index` (created at runtime)
   - Includes FAISS index + metadata
-
   - Uses a `.docs_hash` file to detect when documentation has changed
 
 ---
@@ -229,6 +233,59 @@ data/mkdocs_docs/
 
 ---
 
+## Quickstart (Local Development)
+
+### Minimal Setup
+
+1. **Install dependencies:**
+
+   ```bash
+   poetry install
+   # or: pip install -r requirements.txt
+   ```
+
+2. **Configure environment:**
+
+   ```bash
+   cp .env.example .env
+   # Edit .env and set at minimum:
+   # - OPENAI_API_KEY=your-key
+   # - UPDATE_API_KEY=your-key
+   ```
+
+3. **Place documentation:**
+
+   ```bash
+   # Copy your MkDocs docs to:
+   data/mkdocs_docs/docs/
+   ```
+
+4. **Build the index:**
+
+   ```bash
+   poetry run python scripts/update_index.py
+   ```
+
+5. **Start the server:**
+
+   ```bash
+   poetry run uvicorn app.api.main:app --reload --port 8000
+   ```
+
+6. **Test the API:**
+   ```bash
+   curl -X POST http://localhost:8000/query \
+     -H "Content-Type: application/json" \
+     -d '{"question": "How do I create an app?"}'
+   ```
+
+### Optional Features
+
+- **Postgres logging:** Set `DATABASE_URL` in `.env` to enable analytics logging.
+- **Zoho Desk escalation:** Configure `ZOHO_*` variables in `.env` to enable `/escalate` endpoint (requires `DATABASE_URL`).
+
+---
+
 ## Indexing & Updating the Vector Store
 
 The FAISS index is built from the Markdown files under `data/mkdocs_docs/docs/`.
@@ -239,10 +296,10 @@ You can rebuild the index manually:
 
 ```bash
 # Using Poetry
-poetry run python update_index.py
+poetry run python scripts/update_index.py
 
 # Or with plain Python
-python update_index.py
+python scripts/update_index.py
 ```
 
 This will:
@@ -275,6 +332,7 @@ The service will:
 - Rebuild the index if needed,
 
 - Replace the in-memory `rag_chain` in `app.state` so new queries use the new index.
+- Clear the in-memory response cache so new queries do not reuse stale answers.
 
 Response includes basic stats about documents and chunks.
 
@@ -303,11 +361,23 @@ If not set, the service falls back to the defaults above.
 
 ### Reranking
 
-The retrieval pipeline uses reranking to improve relevance:
+The retrieval pipeline can optionally use LLM-based reranking to improve relevance:
 
 - Base retriever fetches `2x top_k` candidates
 - LLM-based compression filters less relevant chunks
 - Final result contains only the most relevant chunks
+
+**Reranking is disabled by default** (`RERANKING_ENABLED=0`) for faster and cheaper responses.  
+To enable reranking, set in `.env`:
+
+```env
+RERANKING_ENABLED=1
+```
+
+**Trade-offs:**
+
+- **Enabled:** Better quality, but slower and more expensive (extra LLM call per query)
+- **Disabled (default):** Faster responses, lower cost, slightly lower quality
 
 ### Enhanced Sources
 
@@ -358,7 +428,9 @@ Core RAG endpoint.
 
 ```json
 {
-  "question": "How do I create a new Aqtra app?"
+  "question": "How do I create a new Aqtra app?",
+  "page_url": "https://your-app.example.com/docs",
+  "page_title": "Docs page"
 }
 ```
 
@@ -374,24 +446,25 @@ Core RAG endpoint.
       "section_title": "Creating Your First App",
       "section_anchor": "creating-your-first-app",
       "url": "https://docs.aqtra.io/app-development/create-app.html#creating-your-first-app"
-    },
-    {
-      "source": "docs/getting-started/overview.md",
-      "filename": "overview.md",
-      "url": "https://docs.aqtra.io/getting-started/overview.html"
     }
-  ]
+  ],
+  "not_found": false,
+  "request_id": "7f2b0c0a-1b3f-4a79-8b5e-1234567890ab",
+  "latency_ms": 135,
+  "cache_hit": false
 }
 ```
 
 - `answer` — grounded answer generated by the LLM using retrieved chunks.
-
 - `sources` — which documentation files contributed to the answer, relative to `docs/`.
+- `not_found` — `true` when the system determined that the answer is “not found in documentation”.
+- `request_id` — correlation ID for this request (can be reused in `/escalate`).
+- `latency_ms` — end-to-end latency in milliseconds.
+- `cache_hit` — whether the answer was served from the in-memory cache.
 
 By design:
 
-- If the documentation does not contain enough information, the model responds with a clear "not found in documentation" message rather than guessing.
-
+- If the documentation does not contain enough information, the model responds with a clear “not found” style message (`not_found=true`) rather than guessing.
 - The model is instructed to rely exclusively on the provided context.
 
 ### `POST /update_index`
@@ -413,7 +486,7 @@ Triggers a docs hash check and optional index rebuild.
 ```json
 {
   "status": "success",
-  "message": "Индекс успешно обновлен",
+  "message": "Index successfully updated",
   "documents_count": 42,
   "chunks_count": 380,
   "index_size": 380
@@ -422,25 +495,62 @@ Triggers a docs hash check and optional index rebuild.
 
 If the docs have not changed, the index may not be rebuilt (depending on hash comparison).
 
+When the index is rebuilt, the in-memory response cache is also cleared so subsequent `/query` requests use fresh data.
+
+### `POST /escalate`
+
+Escalation endpoint that creates a support ticket in Zoho Desk **only** for requests where `/query` returned `not_found=true`.
+
+**Request body:**
+
+```json
+{
+  "email": "user@example.com",
+  "request_id": "7f2b0c0a-1b3f-4a79-8b5e-1234567890ab",
+  "comment": "What I was trying to do..."
+}
+```
+
+**Response body (example):**
+
+```json
+{
+  "status": "success",
+  "ticket_id": "123456000012345001",
+  "ticket_number": "CASE-1024"
+}
+```
+
+The endpoint:
+
+- Validates rate limits per IP (separate from `/query` / `/update_index`).
+- Verifies that `DATABASE_URL` is configured and that a corresponding `query_logs` entry exists with `not_found=true`.
+- Creates a Zoho Desk ticket using the logged question, answer (if available), page URL/title, and user comment.
+- Logs the escalation in `escalation_logs`.
+
 ---
 
 ## Prompt Configuration
 
-The system prompt and RAG behavior settings are centralized in `app/prompt_config.py` using the `PromptSettings` dataclass.
+The system prompt and RAG behavior settings are centralized in `app/core/prompt_config.py` using the `PromptSettings` dataclass.
 
-### Configuration via Environment Variables
+### Configuration via Environment Variables (Prompt / RAG)
 
 You can customize prompt behavior by setting environment variables in your `.env` file:
 
 ```env
-# Language for responses (ru|en)
-PROMPT_LANGUAGE=ru
+# Supported languages for responses (comma-separated: en,de,fr,es,pt)
+# Only these languages are supported. If user asks in another language, response will be in fallback language.
+PROMPT_SUPPORTED_LANGUAGES=en,de,fr,es,pt
+
+# Fallback language when user's language is not supported (must be one of supported languages)
+PROMPT_FALLBACK_LANGUAGE=en
 
 # Base URL for documentation links
 PROMPT_BASE_DOCS_URL=https://docs.aqtra.io/
 
 # Message when information is not found
-PROMPT_NOT_FOUND_MESSAGE=Информация не найдена в базе документации.
+PROMPT_NOT_FOUND_MESSAGE=Information not found in documentation database.
 
 # Include sources list in response text (true|false)
 PROMPT_INCLUDE_SOURCES_IN_TEXT=true
@@ -449,16 +559,33 @@ PROMPT_INCLUDE_SOURCES_IN_TEXT=true
 PROMPT_MODE=strict
 
 # Default temperature for LLM (0.0-1.0)
-PROMPT_DEFAULT_TEMPERATURE=0.0
+PROMPT_DEFAULT_TEMPERATURE=0.1
 
 # Default number of chunks to retrieve (1-10)
 PROMPT_DEFAULT_TOP_K=4
 
-# Default max tokens for LLM answers (128-4096, balanced default ≈ 1200)
-PROMPT_DEFAULT_MAX_TOKENS=1200
+# Default max tokens for LLM answers (128-4096)
+PROMPT_DEFAULT_MAX_TOKENS=800
 ```
 
 All variables are optional and have sensible defaults. Invalid values fall back to defaults.
+
+**Language Support:**
+
+- Supported output languages: **EN** (English), **DE** (German), **FR** (French), **ES** (Spanish), **PT** (Portuguese)
+- Language is automatically detected from the user's question using lightweight heuristics
+- If the user's language is not supported (e.g., Russian, Italian, Finnish), the response will be in the fallback language (default: English)
+- Repository content and system prompts are English-only; output language is controlled by runtime instruction
+- Cyrillic characters in questions automatically trigger English fallback
+
+**Not Found Semantics:**
+
+- The `not_found` flag is determined by retrieval signals, not by exact string matching
+- `not_found=true` when:
+  - No sources are retrieved (`len(sources) == 0`), OR
+  - Top retrieval score is below threshold (default: 0.20, configurable via `NOT_FOUND_SCORE_THRESHOLD`)
+- This allows multilingual responses (DE/FR/ES/PT) to correctly signal "not found" without requiring an exact English phrase match
+- The `not_found_message` setting is kept for human-facing consistency but is not used for strict equality checks
 
 ### Viewing Current Configuration
 
@@ -472,42 +599,16 @@ Response:
 
 ```json
 {
-  "language": "ru",
+  "supported_languages": ["en", "de", "fr", "es", "pt"],
+  "fallback_language": "en",
   "base_docs_url": "https://docs.aqtra.io/",
-  "not_found_message": "Информация не найдена в базе документации.",
+  "not_found_message": "Information not found in documentation database.",
   "include_sources_in_text": true,
   "mode": "strict",
   "default_temperature": 0.0,
   "default_top_k": 4
 }
 ```
-
-### Per-Request Parameters
-
-The `/query` endpoint accepts optional parameters to override default settings for a single request:
-
-```json
-{
-  "question": "How do I create an app?",
-  "top_k": 6,
-  "temperature": 0.1,
-  "max_tokens": 800
-}
-```
-
-**Parameters:**
-
-- `top_k` (optional, 1-10): Base number of document chunks to retrieve. Defaults to `PROMPT_DEFAULT_TOP_K`. The service adaptively adjusts the effective `top_k` based on question length (short questions use fewer chunks, longer questions may use up to 8–10).
-- `temperature` (optional, 0.0-1.0): LLM temperature for this request. Defaults to `PROMPT_DEFAULT_TEMPERATURE`.
-- `max_tokens` (optional, 128-2048): Maximum tokens in response for this request. Defaults to `PROMPT_DEFAULT_MAX_TOKENS` from `PromptSettings`.
-
-Values outside safe ranges are automatically clamped:
-
-- `top_k`: clamped to 1-10
-- `temperature`: clamped to 0.0-1.0
-- `max_tokens`: clamped to 128-2048
-
-If parameters differ from defaults, a temporary RAG chain is created for the request. This allows fine-tuning retrieval and generation behavior without changing global settings.
 
 ### Recommended Modes
 
@@ -572,10 +673,128 @@ When rate limit is exceeded, the service returns `429 Too Many Requests` with a 
 Query responses are cached in-memory with:
 
 - LRU eviction policy
-- TTL: 10 minutes (configurable via `CACHE_TTL_SECONDS`)
+- TTL: 10 minutes (configurable via `CACHE_TTL_SECONDS`, default 600 seconds)
 - Max size: 500 entries (configurable via `CACHE_MAX_SIZE`)
 
-Cache key includes: normalized question, `top_k`, `temperature`, and prompt settings signature.
+Cache key includes: normalized question and a prompt settings signature (language, mode, top_k, temperature, max_tokens).  
+The cache is automatically cleared when `/update_index` rebuilds the FAISS index to ensure fresh answers after documentation updates.
+
+**Cache Invalidation:**
+
+- Automatic: Cache is cleared after successful `/update_index` operations
+- Manual: Restart the service to clear the cache
+
+---
+
+## Analytics & Postgres Logging
+
+If a Postgres database is configured via `DATABASE_URL`, the service logs basic analytics for queries and escalations.
+
+### Enabling Analytics
+
+Set in `.env`:
+
+```env
+DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/dbname
+IP_HASH_SALT=CHANGE_ME
+```
+
+On startup the service will:
+
+- Initialize an async SQLAlchemy engine and session factory.
+- Create tables (if they don’t exist):
+  - `query_logs`
+  - `escalation_logs`
+
+### Logged Fields
+
+**`query_logs`**
+
+- `id`, `created_at`
+- `request_id` — correlation ID for the request
+- `ip_hash` — salted SHA-256 hash of the client IP (no raw IP stored)
+- `user_agent`
+- `page_url`, `page_title`
+- `question`, `answer` (truncated to a safe length)
+- `not_found` — whether the answer was classified as not found
+- `cache_hit` — whether response came from cache
+- `latency_ms` — end-to-end latency in milliseconds
+- `sources` — JSON list of sources used in the answer
+- `error` — error text if the request failed
+
+**`escalation_logs`**
+
+- `id`, `created_at`
+- `request_id` — the original `/query` request id
+- `email` — user email passed to `/escalate`
+- `zoho_ticket_id`, `zoho_ticket_number` (if available)
+- `status` — `success`, `error`, `not_found`, `rejected`, etc.
+- `error` — error text if escalation failed
+
+For existing databases, you can add the `answer` column manually:
+
+```sql
+ALTER TABLE query_logs ADD COLUMN IF NOT EXISTS answer TEXT;
+```
+
+Retention/cleanup policies for these tables are left to your operations team (e.g. periodic deletion by `created_at`).
+
+---
+
+## Escalation to Zoho Desk
+
+When a `/query` returns `not_found=true`, clients may optionally call `/escalate` to create a support ticket in Zoho Desk.
+
+**Important:**
+
+- Escalation is **only available** for queries where `not_found=true`
+- Requires a valid `email` address in the request
+- Requires both `DATABASE_URL` (for query log lookup) and Zoho Desk configuration
+
+### Configuration
+
+**Required environment variables:**
+
+```env
+# Database (required for escalation)
+DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/dbname
+
+# Zoho Desk OAuth credentials
+ZOHO_ACCOUNTS_BASE_URL=https://accounts.zoho.eu
+ZOHO_DESK_BASE_URL=https://desk.zoho.eu
+
+ZOHO_CLIENT_ID=
+ZOHO_CLIENT_SECRET=
+ZOHO_REFRESH_TOKEN=
+
+ZOHO_DESK_ORG_ID=
+ZOHO_DESK_DEPARTMENT_ID=
+
+# Rate limiting for escalation endpoint
+ESCALATE_RATE_LIMIT=5
+ESCALATE_RATE_WINDOW_SECONDS=3600
+```
+
+**How it works:**
+
+1. The service uses OAuth refresh-token flow to obtain an access token (with in-memory caching, locking and retries for reliability).
+2. Creates tickets via `POST /api/v1/tickets` on Zoho Desk with:
+   - User's email
+   - Original question (truncated to 2000 chars)
+   - Answer from the query log (truncated to 8000 chars, if available)
+   - Page URL/title
+   - User comment (truncated to 2000 chars, if provided)
+   - Formatted sources list (readable multi-line format)
+3. Logs each escalation attempt in `escalation_logs` table with status (`success`, `error`, `not_found`, `rejected`).
+
+**Error handling:**
+
+- If `DATABASE_URL` is not configured → returns `503 Service Unavailable`
+- If Zoho env vars are missing → returns `503 Service Unavailable`
+- If `request_id` not found in query logs → returns `404 Not Found`
+- If original query was not `not_found=true` → returns `400 Bad Request` (escalation only allowed for not-found queries)
+
+**Recommendation:** Test Zoho Desk connectivity before production deployment (e.g., create a test ticket manually or via a healthcheck script).
 
 ---
 
@@ -702,6 +921,31 @@ Then:
 - Edit `app/main.py` to add endpoints, middleware, or metrics.
 
 - Keep the API contract of `/query` and `/update_index` stable unless you intentionally version it.
+
+---
+
+## Quality Gates / Checks
+
+### English-Only Repository Check
+
+To ensure the repository remains English-only (no Cyrillic characters, no legacy Russian language support):
+
+```bash
+./scripts/check_english_only.sh
+```
+
+This script:
+
+- Checks for Cyrillic characters (Unicode range U+0400-U+04FF) in all files
+- Checks for legacy Russian language markers (`PROMPT_LANGUAGE`, `ru` language references, etc.)
+- Excludes build artifacts (venv/, vectorstore/, .git/, dist/, build/, **pycache**/, \*.ipynb)
+
+The script fails if any violations are found. Use it before committing changes or in CI/CD pipelines.
+
+**Note:** The script requires `ripgrep` (rg). Install via:
+
+- macOS: `brew install ripgrep`
+- Linux: `apt-get install ripgrep` or `yum install ripgrep`
 
 ---
 

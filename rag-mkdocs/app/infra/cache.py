@@ -1,5 +1,5 @@
 """
-In-memory кэш для ответов RAG.
+In-memory cache for RAG responses.
 """
 
 import hashlib
@@ -11,81 +11,81 @@ from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
 
-# Настройки кэша
+# Cache settings
 CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", "500"))
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "600"))  # 10 минут по умолчанию
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "600"))  # 10 minutes by default
 
 
 class LRUCache:
-    """LRU кэш с TTL."""
+    """LRU cache with TTL."""
     
     def __init__(self, max_size: int = CACHE_MAX_SIZE, ttl_seconds: int = CACHE_TTL_SECONDS):
         """
         Args:
-            max_size: Максимальное количество элементов
-            ttl_seconds: Время жизни записи в секундах
+            max_size: Maximum number of elements
+            ttl_seconds: Entry lifetime in seconds
         """
         self.max_size = max_size
         self.ttl_seconds = ttl_seconds
         self.cache: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
     
     def _generate_key(self, question: str, settings_signature: str) -> str:
-        """Генерирует ключ кэша.
+        """Generates cache key.
         
-        Ключ завязан только на текст вопроса и сигнатуру настроек промпта,
-        чтобы избежать взрывного роста кэша из-за per-request параметров.
+        Key is based only on question text and prompt settings signature,
+        to avoid explosive cache growth due to per-request parameters.
         """
-        normalized_question = question.strip().lower()[:500]  # Ограничиваем длину
+        normalized_question = question.strip().lower()[:500]  # Limit length
         key_data = f"{normalized_question}|{settings_signature}"
         return hashlib.md5(key_data.encode()).hexdigest()
     
     def get(self, key: str) -> Optional[Any]:
         """
-        Получает значение из кэша.
+        Gets value from cache.
         
         Args:
-            key: Ключ кэша
+            key: Cache key
             
         Returns:
-            Значение или None если не найдено или истекло
+            Value or None if not found or expired
         """
         if key not in self.cache:
             return None
         
         value, timestamp = self.cache[key]
         
-        # Проверяем TTL
+        # Check TTL
         if time.time() - timestamp > self.ttl_seconds:
             del self.cache[key]
             return None
         
-        # Перемещаем в конец (LRU)
+        # Move to end (LRU)
         self.cache.move_to_end(key)
         return value
     
     def set(self, key: str, value: Any):
         """
-        Сохраняет значение в кэш.
+        Saves value to cache.
         
         Args:
-            key: Ключ кэша
-            value: Значение для сохранения
+            key: Cache key
+            value: Value to save
         """
-        # Удаляем старые записи если достигли лимита
+        # Remove old entries if limit reached
         while len(self.cache) >= self.max_size:
-            self.cache.popitem(last=False)  # Удаляем самый старый
+            self.cache.popitem(last=False)  # Remove oldest
         
         self.cache[key] = (value, time.time())
     
     def clear(self):
-        """Очищает кэш."""
+        """Clears cache."""
         self.cache.clear()
     
     def size(self) -> int:
-        """Возвращает текущий размер кэша."""
+        """Returns current cache size."""
         return len(self.cache)
 
 
-# Глобальный экземпляр кэша
+# Global cache instance
 response_cache = LRUCache()
 

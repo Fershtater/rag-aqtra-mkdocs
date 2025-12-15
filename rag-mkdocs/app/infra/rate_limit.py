@@ -1,5 +1,5 @@
 """
-Простой in-memory rate limiter для API endpoints.
+Simple in-memory rate limiter for API endpoints.
 """
 
 import logging
@@ -10,7 +10,7 @@ from typing import Dict, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
-# Настройки по умолчанию
+# Default settings
 QUERY_RATE_LIMIT = int(os.getenv("QUERY_RATE_LIMIT", "30"))
 QUERY_RATE_WINDOW_SECONDS = int(os.getenv("QUERY_RATE_WINDOW_SECONDS", "60"))
 UPDATE_RATE_LIMIT = int(os.getenv("UPDATE_RATE_LIMIT", "3"))
@@ -20,22 +20,22 @@ ESCALATE_RATE_WINDOW_SECONDS = int(os.getenv("ESCALATE_RATE_WINDOW_SECONDS", "36
 
 
 class RateLimiter:
-    """Простой in-memory rate limiter с sliding window."""
+    """Simple in-memory rate limiter with sliding window."""
     
     def __init__(self, limit: int, window_seconds: int):
         """
         Args:
-            limit: Максимальное количество запросов
-            window_seconds: Окно времени в секундах
+            limit: Maximum number of requests
+            window_seconds: Time window in seconds
         """
         self.limit = limit
         self.window_seconds = window_seconds
         self.requests: Dict[str, list] = defaultdict(list)
         self._last_cleanup = time.time()
-        self._cleanup_interval = 300  # Очистка каждые 5 минут
+        self._cleanup_interval = 300  # Cleanup every 5 minutes
     
     def _cleanup_old_entries(self):
-        """Удаляет старые записи из словаря."""
+        """Removes old entries from dictionary."""
         current_time = time.time()
         if current_time - self._last_cleanup < self._cleanup_interval:
             return
@@ -55,38 +55,38 @@ class RateLimiter:
     
     def is_allowed(self, key: str) -> Tuple[bool, Optional[str]]:
         """
-        Проверяет, разрешен ли запрос.
+        Checks if request is allowed.
         
         Args:
-            key: Идентификатор клиента (IP, API key и т.п.)
+            key: Client identifier (IP, API key, etc.)
             
         Returns:
-            Кортеж (разрешен, сообщение_об_ошибке)
+            Tuple (allowed, error_message)
         """
         self._cleanup_old_entries()
         
         current_time = time.time()
         cutoff_time = current_time - self.window_seconds
         
-        # Фильтруем старые запросы
+        # Filter old requests
         timestamps = self.requests[key]
         timestamps = [ts for ts in timestamps if ts > cutoff_time]
         self.requests[key] = timestamps
         
-        # Проверяем лимит
+        # Check limit
         if len(timestamps) >= self.limit:
             oldest_request = min(timestamps)
             retry_after = int(self.window_seconds - (current_time - oldest_request))
             return False, f"Rate limit exceeded. Try again after {retry_after} seconds."
         
-        # Добавляем текущий запрос
+        # Add current request
         timestamps.append(current_time)
         self.requests[key] = timestamps
         
         return True, None
 
 
-# Глобальные экземпляры лимитеров
+# Global limiter instances
 query_limiter = RateLimiter(QUERY_RATE_LIMIT, QUERY_RATE_WINDOW_SECONDS)
 update_limiter = RateLimiter(UPDATE_RATE_LIMIT, UPDATE_RATE_WINDOW_SECONDS)
 escalate_limiter = RateLimiter(ESCALATE_RATE_LIMIT, ESCALATE_RATE_WINDOW_SECONDS)

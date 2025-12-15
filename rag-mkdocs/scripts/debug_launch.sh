@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
-# Скрипт для локального запуска dev-сервера RAG-ассистента
-# Использование: ./debug_launch.sh [дополнительные параметры uvicorn]
+# Script for local launch of RAG assistant dev server
+# Usage: ./debug_launch.sh [additional uvicorn parameters]
 
 set -euo pipefail
 
-# Цвета для вывода
+# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -20,38 +20,38 @@ error() {
     echo -e "${RED}[debug_launch] ERROR:${NC} $1" >&2
 }
 
-# Определяем директорию скрипта и корень проекта
+# Determine script directory and project root
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${SCRIPT_DIR}"
 cd "${PROJECT_ROOT}"
 
-# Загрузка .env если существует
+# Load .env if exists
 if [ -f "${PROJECT_ROOT}/.env" ]; then
     set -o allexport
-    # Загружаем .env, но не выводим значения переменных
+    # Load .env but don't output variable values
     source "${PROJECT_ROOT}/.env" 2>/dev/null || true
     set +o allexport
-    info ".env файл загружен"
+    info ".env file loaded"
 else
-    info ".env файл не найден, используем системные переменные окружения"
+    info ".env file not found, using system environment variables"
 fi
 
-# Установка дефолтов для окружения
+# Set defaults for environment
 ENV="${ENV:-development}"
 LOG_LEVEL="${LOG_LEVEL:-DEBUG}"
 PORT="${PORT:-8000}"
 
-# Проверка Poetry
+# Check Poetry
 if ! command -v poetry &> /dev/null; then
     error "Poetry is required to run debug server"
     error "Install Poetry: curl -sSL https://install.python-poetry.org | python3 -"
     exit 1
 fi
 
-# Вывод информации о запуске
+# Output launch information
 info "ENV=${ENV}, LOG_LEVEL=${LOG_LEVEL}, PORT=${PORT}"
 info "Starting uvicorn app.api.main:app ..."
 
-# Запуск сервера через Poetry
-# Передаем дополнительные параметры, если они есть
+# Start server via Poetry
+# Pass additional parameters if provided
 exec poetry run uvicorn app.api.main:app --reload --port "${PORT}" "$@"

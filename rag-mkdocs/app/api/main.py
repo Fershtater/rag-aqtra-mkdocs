@@ -1,45 +1,45 @@
 """
-FastAPI приложение для RAG-ассистента MkDocs.
+FastAPI application for RAG assistant MkDocs.
 
-Обоснование выбора FastAPI для RAG API:
+Rationale for choosing FastAPI for RAG API:
 
-1. АСИНХРОННОСТЬ:
-   - Нативная поддержка async/await для эффективной работы с LLM API
-   - Не блокирует event loop при ожидании ответов от OpenAI
-   - Может обрабатывать несколько запросов параллельно
-   - Критично для RAG, где каждый запрос требует:
-     * Векторный поиск (может быть медленным)
-     * API вызовы к OpenAI (сетевые задержки)
-     * Обработка больших контекстов
+1. ASYNCHRONOUS:
+   - Native async/await support for efficient LLM API work
+   - Does not block event loop when waiting for OpenAI responses
+   - Can handle multiple requests in parallel
+   - Critical for RAG, where each request requires:
+     * Vector search (can be slow)
+     * OpenAI API calls (network delays)
+     * Large context processing
 
-2. ПРОИЗВОДИТЕЛЬНОСТЬ:
-   - Один из самых быстрых Python веб-фреймворков
-   - Основан на Starlette и Pydantic
-   - Автоматическая валидация данных через Pydantic
-   - Минимальные накладные расходы
+2. PERFORMANCE:
+   - One of the fastest Python web frameworks
+   - Based on Starlette and Pydantic
+   - Automatic data validation via Pydantic
+   - Minimal overhead
 
-3. ТИПИЗАЦИЯ И ВАЛИДАЦИЯ:
-   - Полная поддержка type hints
-   - Автоматическая валидация входных данных
-   - Автоматическая генерация OpenAPI/Swagger документации
-   - Улучшает надежность и отладку
+3. TYPING AND VALIDATION:
+   - Full type hints support
+   - Automatic input data validation
+   - Automatic OpenAPI/Swagger documentation generation
+   - Improves reliability and debugging
 
-4. АВТОМАТИЧЕСКАЯ ДОКУМЕНТАЦИЯ:
-   - Swagger UI на /docs
-   - ReDoc на /redoc
-   - Позволяет тестировать API без дополнительных инструментов
-   - Упрощает интеграцию для клиентов
+4. AUTOMATIC DOCUMENTATION:
+   - Swagger UI at /docs
+   - ReDoc at /redoc
+   - Allows testing API without additional tools
+   - Simplifies integration for clients
 
-5. ИНТЕГРАЦИЯ С LANGCHAIN:
-   - LangChain поддерживает async вызовы
-   - FastAPI легко интегрируется с async цепочками
-   - Можно использовать background tasks для долгих операций
+5. LANGCHAIN INTEGRATION:
+   - LangChain supports async calls
+   - FastAPI easily integrates with async chains
+   - Can use background tasks for long operations
 
-6. МАСШТАБИРУЕМОСТЬ:
-   - Легко добавить middleware (логирование, CORS, аутентификация)
-   - Поддержка WebSocket для streaming ответов
-   - Можно легко добавить rate limiting
-   - Готов к production deployment
+6. SCALABILITY:
+   - Easy to add middleware (logging, CORS, authentication)
+   - WebSocket support for streaming responses
+   - Can easily add rate limiting
+   - Ready for production deployment
 """
 
 import asyncio
@@ -63,7 +63,7 @@ from app.core.rag_chain import (
     chunk_documents,
     load_mkdocs_documents,
 )
-from app.core.prompt_config import load_prompt_settings_from_env
+from app.core.prompt_config import load_prompt_settings_from_env, detect_response_language
 from app.core.markdown_utils import build_doc_url
 from app.infra.rate_limit import query_limiter, update_limiter, escalate_limiter
 from app.infra.cache import response_cache
@@ -77,14 +77,14 @@ from app.infra.metrics import (
     update_index_duration_seconds,
     PROMETHEUS_AVAILABLE,
 )
-from app.infra.db import init_db, get_sessionmaker
+from app.infra.db import init_db
 from app.infra.analytics import hash_ip, log_query, log_escalation
 from app.infra.zoho_desk import create_ticket
 
-# Загружаем переменные окружения из .env файла
+# Load environment variables from .env file
 load_dotenv()
 
-# Настройка логирования с поддержкой LOG_LEVEL
+# Configure logging with LOG_LEVEL support
 env = os.getenv("ENV", "production").lower()
 log_level_str = os.getenv("LOG_LEVEL", "DEBUG" if env == "development" else "INFO")
 log_level = getattr(logging, log_level_str.upper(), logging.INFO)
@@ -95,44 +95,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-logger.info(f"Логирование настроено: уровень={log_level_str}, режим={env}")
+logger.info(f"Logging configured: level={log_level_str}, mode={env}")
 
-# Проверяем наличие обязательных переменных окружения при старте
+# Check for required environment variables on startup
 api_key = os.getenv("OPENAI_API_KEY")
 if api_key is None:
-    logger.error("OPENAI_API_KEY не найден в переменных окружения")
+    logger.error("OPENAI_API_KEY not found in environment variables")
     raise ValueError(
         "OPENAI_API_KEY not set in .env\n"
-        "Создайте файл .env из .env.example и добавьте OPENAI_API_KEY=your-key"
+        "Create .env file from .env.example and add OPENAI_API_KEY=your-key"
     )
-logger.info("✓ OPENAI_API_KEY найден в переменных окружения")
+logger.info("✓ OPENAI_API_KEY found in environment variables")
 
 
-# Pydantic модели для валидации данных
+# Pydantic models for data validation
 class Query(BaseModel):
-    """Модель запроса пользователя."""
-    question: str = Field(..., max_length=2000, description="Вопрос пользователя (макс. 2000 символов)")
-    page_url: Optional[str] = Field(None, description="URL страницы, с которой задан вопрос")
-    page_title: Optional[str] = Field(None, description="Заголовок страницы, с которой задан вопрос")
+    """User request model."""
+    question: str = Field(..., max_length=2000, description="User question (max 2000 characters)")
+    page_url: Optional[str] = Field(None, description="URL of the page from which the question was asked")
+    page_title: Optional[str] = Field(None, description="Title of the page from which the question was asked")
     
     @validator('question')
     def validate_question_length(cls, v):
         if len(v.strip()) > 2000:
-            raise ValueError("Вопрос слишком длинный (максимум 2000 символов)")
+            raise ValueError("Question is too long (maximum 2000 characters)")
         return v.strip()
     
     class Config:
         json_schema_extra = {
             "example": {
-                "question": "Как использовать эту функцию?",
-                "top_k": 4,
-                "temperature": 0.0
+                "question": "How do I use this function?",
+                "page_url": "https://your-app.example.com/docs",
+                "page_title": "Documentation page"
             }
         }
 
 
 class QueryResponse(BaseModel):
-    """Модель ответа RAG-системы."""
+    """RAG system response model."""
     answer: str
     sources: List[Dict[str, str]]
     not_found: bool
@@ -143,7 +143,7 @@ class QueryResponse(BaseModel):
     class Config:
         json_schema_extra = {
             "example": {
-                "answer": "Для использования функции нужно...",
+                "answer": "To use this function you need...",
                 "sources": [
                     {
                         "source": "data/mkdocs_docs/docs/example.md",
@@ -154,17 +154,24 @@ class QueryResponse(BaseModel):
         }
 
 
+class EscalateRequest(BaseModel):
+    """Support escalation request."""
+
+    email: EmailStr
+    request_id: str
+    comment: Optional[str] = None
+
 def calculate_effective_top_k(question: str, base_top_k: int, mode: str) -> int:
     """
-    Простая адаптация top_k по длине вопроса.
+    Simple top_k adaptation based on question length.
     
     Args:
-        question: Текст вопроса пользователя
-        base_top_k: Базовое значение top_k (из настроек или запроса)
-        mode: Режим промпта (strict|helpful) — оставлен для будущих расширений
+        question: User question text
+        base_top_k: Base top_k value (from settings or request)
+        mode: Prompt mode (strict|helpful) — reserved for future extensions
     
     Returns:
-        Адаптированное значение top_k в разумных пределах.
+        Adapted top_k value within reasonable limits.
     """
     words = question.split()
     length = len(words)
@@ -175,12 +182,12 @@ def calculate_effective_top_k(question: str, base_top_k: int, mode: str) -> int:
     elif length > 10:
         k = max(base_top_k, 6)
 
-    # Ограничим сверху, чтобы не перегружать retriever
+    # Limit from above to avoid overloading retriever
     return min(max(1, k), 10)
 
 
 class ErrorResponse(BaseModel):
-    """Модель ответа с ошибкой."""
+    """Error response model."""
 
     error: str
     detail: Optional[str] = None
@@ -189,82 +196,82 @@ class ErrorResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Lifespan контекст для инициализации и очистки ресурсов.
+    Lifespan context for initialization and resource cleanup.
     
-    Выполняется при старте:
-    - Загружает vectorstore
-    - Создает RAG цепочку
-    - Сохраняет в app.state
+    Executed on startup:
+    - Loads vectorstore
+    - Creates RAG chain
+    - Saves to app.state
     
-    Выполняется при остановке:
-    - Очищает ресурсы
+    Executed on shutdown:
+    - Cleans up resources
     """
-    # Startup: инициализация RAG цепочки
+    # Startup: RAG chain initialization
     logger.info("=" * 60)
-    logger.info("ЗАПУСК FASTAPI ПРИЛОЖЕНИЯ")
+    logger.info("STARTING FASTAPI APPLICATION")
     logger.info("=" * 60)
-    logger.info("Инициализация RAG цепочки...")
+    logger.info("Initializing RAG chain...")
     
     try:
-        # Загружаем vectorstore и создаем RAG цепочку с настройками
+        # Load vectorstore and create RAG chain with settings
         rag_chain, vectorstore, prompt_settings = build_rag_chain_and_settings()
         
-        # Сохраняем в app.state для доступа из endpoints
+        # Save to app.state for access from endpoints
         app.state.vectorstore = vectorstore
         app.state.rag_chain = rag_chain
         app.state.prompt_settings = prompt_settings
         
-        logger.info("RAG цепочка готова к использованию")
+        logger.info("RAG chain ready for use")
         logger.info("=" * 60)
     except Exception as e:
-        logger.error(f"Ошибка при инициализации RAG цепочки: {e}", exc_info=True)
-        logger.error("Приложение запущено, но RAG недоступен")
+        logger.error(f"Error initializing RAG chain: {e}", exc_info=True)
+        logger.error("Application started but RAG is unavailable")
         app.state.vectorstore = None
         app.state.rag_chain = None
         app.state.prompt_settings = None
 
-    # Инициализируем БД для логирования, если настроен DATABASE_URL
+    # Initialize database for logging if DATABASE_URL is configured
     db_url = os.getenv("DATABASE_URL")
     if db_url:
         try:
-            logger.info("Инициализирую подключение к БД для логирования...")
+            logger.info("Initializing database connection for logging...")
             db_sessionmaker = await init_db(db_url)
             app.state.db_sessionmaker = db_sessionmaker
-            logger.info("Подключение к БД успешно инициализировано")
+            logger.info("Database connection successfully initialized")
         except Exception as e:
-            logger.error("Не удалось инициализировать БД: %s", e, exc_info=True)
+            logger.error("Failed to initialize database: %s", e, exc_info=True)
             app.state.db_sessionmaker = None
     else:
-        logger.info("DATABASE_URL не задан, логирование в БД отключено")
+        logger.info("DATABASE_URL not set, database logging disabled")
         app.state.db_sessionmaker = None
     
     yield
     
-    # Shutdown: очистка ресурсов
-    logger.info("Остановка приложения...")
+    # Shutdown: resource cleanup
+    logger.info("Stopping application...")
     app.state.vectorstore = None
     app.state.rag_chain = None
     app.state.prompt_settings = None
     app.state.db_sessionmaker = None
 
 
-# Создаем FastAPI приложение с lifespan
+# Create FastAPI application with lifespan
 app = FastAPI(
     title="RAG MkDocs Assistant API",
-    description="API для вопросов по документации MkDocs с использованием RAG",
+    description="API for documentation questions using RAG",
     version="1.0.0",
     lifespan=lifespan
 )
 
-# Middleware для correlation IDs
+# Middleware for correlation IDs
 @app.middleware("http")
 async def correlation_id_middleware(request: Request, call_next):
-    """Добавляет correlation ID к каждому запросу."""
-    # Читаем или генерируем request ID
+    """Adds correlation ID to each request."""
+    # Read or generate request ID
     request_id = request.headers.get("X-Request-Id", str(uuid.uuid4()))
     request.state.request_id = request_id
     
-    # Обновляем формат логирования для включения request_id
+    # Update logging format to include request_id
     old_factory = logging.getLogRecordFactory()
     def record_factory(*args, **kwargs):
         record = old_factory(*args, **kwargs)
@@ -276,28 +283,28 @@ async def correlation_id_middleware(request: Request, call_next):
     response.headers["X-Request-Id"] = request_id
     return response
 
-# Добавляем CORS middleware для работы с фронтендом
-# CORS origins настраиваются через переменную окружения CORS_ORIGINS (список через запятую)
-# Если не указано, используется "*" только для development режима
+# Add CORS middleware for frontend integration
+# CORS origins configured via environment variable CORS_ORIGINS (comma-separated list)
+# If not specified, "*" is used only in development mode
 cors_origins_str = os.getenv("CORS_ORIGINS", "")
 if cors_origins_str:
     cors_origins = [origin.strip() for origin in cors_origins_str.split(",") if origin.strip()]
 else:
-    # Fallback: разрешаем все только в development
+    # Fallback: allow all only in development
     cors_origins = ["*"] if env == "development" else []
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST"],  # Ограничиваем методы
-    allow_headers=["Content-Type", "X-API-Key", "X-Request-Id"],  # Ограничиваем заголовки
+    allow_methods=["GET", "POST"],  # Limit methods
+    allow_headers=["Content-Type", "X-API-Key", "X-Request-Id"],  # Limit headers
 )
 
 
 @app.get("/")
 async def root():
-    """Корневой endpoint для проверки работы API."""
+    """Root endpoint to check API status."""
     return {
         "message": "RAG MkDocs Assistant API",
         "status": "running",
@@ -307,7 +314,7 @@ async def root():
 
 @app.get("/metrics")
 async def metrics_endpoint():
-    """Endpoint для метрик Prometheus."""
+    """Metrics endpoint Prometheus."""
     content, content_type = get_metrics_response()
     return Response(content=content, media_type=content_type)
 
@@ -315,10 +322,10 @@ async def metrics_endpoint():
 @app.get("/health")
 async def health_check(request: Request):
     """
-    Health check endpoint для мониторинга.
+    Health check endpoint for monitoring.
     
     Returns:
-        JSON с статусом приложения и готовностью RAG цепочки
+        JSON with application status and RAG chain readiness
     """
     rag_chain = getattr(request.app.state, "rag_chain", None)
     return {
@@ -330,23 +337,24 @@ async def health_check(request: Request):
 @app.get("/config/prompt")
 async def get_prompt_config(request: Request):
     """
-    Возвращает текущие настройки промпта.
+    Returns current prompt settings.
     
     Returns:
-        JSON с настройками промпта из app.state.prompt_settings
+        JSON with prompt settings from app.state.prompt_settings
     """
     prompt_settings = getattr(request.app.state, "prompt_settings", None)
     if prompt_settings is None:
         return JSONResponse(
             status_code=503,
             content={
-                "error": "Настройки промпта не загружены",
-                "detail": "RAG цепочка не инициализирована"
+                "error": "Prompt settings not loaded",
+                "detail": "RAG chain not initialized"
             }
         )
     
     return {
-        "language": prompt_settings.language,
+        "supported_languages": list(prompt_settings.supported_languages),
+        "fallback_language": prompt_settings.fallback_language,
         "base_docs_url": prompt_settings.base_docs_url,
         "not_found_message": prompt_settings.not_found_message,
         "include_sources_in_text": prompt_settings.include_sources_in_text,
@@ -360,17 +368,17 @@ async def get_prompt_config(request: Request):
 @app.post("/query", response_model=QueryResponse, responses={429: {"model": ErrorResponse}, 503: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
 async def query_documentation(query: Query, request: Request):
     """
-    Основной endpoint для вопросов по документации.
+    Main endpoint for documentation questions.
     
-    Принимает вопрос пользователя и возвращает ответ на основе RAG-системы.
-    Поддерживает кэширование, rate limiting и метрики.
+    Accepts user question and returns answer based on RAG system.
+    Supports caching, rate limiting and metrics.
     
     Args:
-        query: Объект Query с вопросом пользователя
-        request: FastAPI Request для доступа к app.state
+        query: Query object with user question
+        request: FastAPI Request for accessing app.state
         
     Returns:
-        QueryResponse с ответом и списком источников
+        QueryResponse with answer and list of sources
     """
     request_id = getattr(request.state, "request_id", "unknown")
     start_time = time()
@@ -387,43 +395,55 @@ async def query_documentation(query: Query, request: Request):
             content={"error": "Rate limit exceeded", "detail": error_msg}
         )
     
-    # Получаем RAG цепочку из app.state
+    # Get RAG chain from app.state
     rag_chain = getattr(request.app.state, "rag_chain", None)
     
     if rag_chain is None:
-        logger.error(f"[{request_id}] RAG цепочка не инициализирована")
+        logger.error(f"[{request_id}] RAG chain not initialized")
         if PROMETHEUS_AVAILABLE and query_requests_total is not None:
             query_requests_total.labels(status="error").inc()
         return JSONResponse(
             status_code=503,
             content={
-                "error": "RAG цепочка не инициализирована",
-                "detail": "Попробуйте позже или проверьте логи приложения"
+                "error": "RAG chain not initialized",
+                "detail": "Please try again later or check application logs"
             }
         )
     
     try:
-        # Получаем настройки промпта из app.state
+        # Get prompt settings from app.state
         prompt_settings = getattr(request.app.state, "prompt_settings", None)
         if prompt_settings is None:
             prompt_settings = load_prompt_settings_from_env()
 
-        # Сигнатура настроек для кэша: фиксируем только стабильные параметры
+        # Detect response language from user question
+        response_language = detect_response_language(
+            query.question,
+            supported=set(prompt_settings.supported_languages),
+            fallback=prompt_settings.fallback_language
+        )
+        
+        # Settings signature for cache: include language configuration for cache stability
+        # Include detector_version to invalidate cache if detection rules change
+        detector_version = "v1"
+        reranking_enabled = os.getenv("RERANKING_ENABLED", "0").lower() in ("1", "true", "yes")
         settings_signature = (
-            f"{prompt_settings.language}_"
-            f"{prompt_settings.mode}_"
-            f"{prompt_settings.default_top_k}_"
-            f"{prompt_settings.default_temperature}_"
-            f"{getattr(prompt_settings, 'default_max_tokens', None)}"
+            f"mode={prompt_settings.mode}_"
+            f"top_k={prompt_settings.default_top_k}_"
+            f"temp={prompt_settings.default_temperature}_"
+            f"max_tokens={getattr(prompt_settings, 'default_max_tokens', None)}_"
+            f"supported={','.join(sorted(prompt_settings.supported_languages))}_"
+            f"fallback={prompt_settings.fallback_language}_"
+            f"rerank={reranking_enabled}_"
+            f"detector={detector_version}"
         )
 
-        # Генерируем ключ кэша
+        # Generate cache key
         cache_key = response_cache._generate_key(query.question, settings_signature)
 
-        # Проверяем кэш
+        # Check cache
         cached_result: Optional[QueryResponse] = response_cache.get(cache_key)
-        cache_hit = cached_result is not None
-
+        
         if cached_result:
             logger.debug(f"[{request_id}] Cache hit for query")
             latency = int((time() - start_time) * 1000)
@@ -431,7 +451,7 @@ async def query_documentation(query: Query, request: Request):
                 query_requests_total.labels(status="success").inc()
                 query_latency_seconds.observe(latency / 1000.0)
 
-            # Логируем запрос даже при cache hit
+            # Log request even on cache hit
             db_sessionmaker = getattr(request.app.state, "db_sessionmaker", None)
             sources = cached_result.sources or []
             not_found_flag = cached_result.not_found
@@ -446,6 +466,7 @@ async def query_documentation(query: Query, request: Request):
                 page_url=query.page_url,
                 page_title=query.page_title,
                 question=query.question,
+                answer=cached_result.answer,
                 not_found=not_found_flag,
                 cache_hit=True,
                 latency_ms=latency,
@@ -455,32 +476,36 @@ async def query_documentation(query: Query, request: Request):
 
             return cached_result
 
-        # Вызываем RAG цепочку с вопросом пользователя асинхронно
+        # Call RAG chain with user question and detected response language
         try:
-            result = await asyncio.to_thread(rag_chain.invoke, {"input": query.question})
+            chain_input = {
+                "input": query.question,
+                "response_language": response_language
+            }
+            result = await asyncio.to_thread(rag_chain.invoke, chain_input)
         except Exception as e:
-            logger.error(f"[{request_id}] Ошибка при вызове LLM: {e}", exc_info=True)
+            logger.error(f"[{request_id}] Error calling LLM: {e}", exc_info=True)
             if PROMETHEUS_AVAILABLE and query_requests_total is not None:
                 query_requests_total.labels(status="error").inc()
                 query_latency_seconds.observe(time() - start_time)
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "Ошибка при обработке запроса",
-                    "detail": "Сервис временно недоступен. Попробуйте позже."
+                    "error": "Error processing request",
+                    "detail": "Service temporarily unavailable. Please try again later."
                 }
             )
         
-        # Извлекаем ответ
-        answer = result.get("answer", "Не удалось сгенерировать ответ")
+        # Extract answer
+        answer = result.get("answer", "Failed to generate answer")
         
-        # Извлекаем источники из metadata найденных документов
-        # В LangChain 0.2.0 create_retrieval_chain возвращает:
-        # - "answer": сгенерированный ответ
-        # - "context": список Document объектов, использованных для генерации
+        # Extract sources from metadata of found documents
+        # In LangChain 0.2.0 create_retrieval_chain returns:
+        # - "answer": generated answer
+        # - "context": list of Document objects used for generation
         sources = []
         
-        # Извлекаем источники из context
+        # Extract sources from context
         if "context" in result:
             context_docs = result["context"]
             if not isinstance(context_docs, list):
@@ -501,7 +526,7 @@ async def query_documentation(query: Query, request: Request):
                         "filename": doc.metadata.get("filename", source.split("/")[-1])
                     }
                     
-                    # Добавляем новые поля если есть
+                    # Add new fields if available
                     if "section_title" in doc.metadata:
                         source_info["section_title"] = doc.metadata["section_title"]
                     if "section_anchor" in doc.metadata:
@@ -520,7 +545,7 @@ async def query_documentation(query: Query, request: Request):
                     
                     sources.append(source_info)
         
-        # Fallback: пытаемся извлечь из source_documents
+        # Fallback: try to extract from source_documents
         if not sources and "source_documents" in result:
             for doc in result["source_documents"]:
                 if hasattr(doc, "metadata") and doc.metadata:
@@ -546,16 +571,24 @@ async def query_documentation(query: Query, request: Request):
                         )
                     sources.append(source_info)
         
-        # Определяем not_found по сообщению и/или отсутствию источников
-        not_found_flag = (
-            answer.strip() == prompt_settings.not_found_message.strip()
-            or len(sources) == 0
-        )
+        # Determine not_found by retrieval signals (sources count and score threshold)
+        # Do not rely on exact string match to support multilingual output
+        not_found_score_threshold = float(os.getenv("NOT_FOUND_SCORE_THRESHOLD", "0.20"))
+        not_found_flag = len(sources) == 0
+        
+        # If sources have scores, also check threshold
+        if sources:
+            # Extract scores from sources if available
+            scores = [s.get("score") for s in sources if isinstance(s, dict) and s.get("score") is not None]
+            if scores:
+                top_score = max(scores)
+                if top_score < not_found_score_threshold:
+                    not_found_flag = True
 
         latency_sec = time() - start_time
         latency_ms = int(latency_sec * 1000)
 
-        # Формируем ответ
+        # Form response
         response = QueryResponse(
             answer=answer,
             sources=sources,
@@ -565,15 +598,15 @@ async def query_documentation(query: Query, request: Request):
             cache_hit=False,
         )
 
-        # Сохраняем в кэш
+        # Save to cache
         response_cache.set(cache_key, response)
 
-        # Обновляем метрики
+        # Update metrics
         if PROMETHEUS_AVAILABLE and query_requests_total is not None:
             query_requests_total.labels(status="success").inc()
             query_latency_seconds.observe(latency_sec)
 
-        # Логируем в БД (если доступно)
+        # Log to database (if available)
         db_sessionmaker = getattr(request.app.state, "db_sessionmaker", None)
         ip_hash_value = hash_ip(client_ip)
         user_agent = request.headers.get("User-Agent")
@@ -586,6 +619,7 @@ async def query_documentation(query: Query, request: Request):
             page_url=query.page_url,
             page_title=query.page_title,
             question=query.question,
+            answer=answer,
             not_found=not_found_flag,
             cache_hit=False,
             latency_ms=latency_ms,
@@ -594,7 +628,7 @@ async def query_documentation(query: Query, request: Request):
         )
 
         logger.info(
-            "[%s] Запрос обработан успешно, источников: %s, not_found=%s, cache_hit=%s, latency_ms=%s",
+            "[%s] Request processed successfully, sources: %s, not_found=%s, cache_hit=%s, latency_ms=%s",
             request_id,
             len(sources),
             not_found_flag,
@@ -604,12 +638,12 @@ async def query_documentation(query: Query, request: Request):
         return response
         
     except Exception as e:
-        logger.error(f"[{request_id}] Ошибка при обработке запроса: {e}", exc_info=True)
+        logger.error(f"[{request_id}] Error processing request: {e}", exc_info=True)
         if PROMETHEUS_AVAILABLE and query_requests_total is not None:
             query_requests_total.labels(status="error").inc()
             query_latency_seconds.observe(time() - start_time)
 
-        # Пытаемся залогировать ошибку запроса
+        # Try to log request error
         try:
             db_sessionmaker = getattr(request.app.state, "db_sessionmaker", None)
             ip_hash_value = hash_ip(client_ip)
@@ -624,6 +658,7 @@ async def query_documentation(query: Query, request: Request):
                 page_url=query.page_url,
                 page_title=query.page_title,
                 question=query.question,
+                answer=None,
                 not_found=False,
                 cache_hit=False,
                 latency_ms=latency_ms,
@@ -631,13 +666,13 @@ async def query_documentation(query: Query, request: Request):
                 error=str(e),
             )
         except Exception:
-            # Логирование ошибок логирования опускаем, чтобы не маскировать основную ошибку
+            # Skip logging errors to avoid masking the main error
             pass
         return JSONResponse(
             status_code=500,
             content={
-                "error": "Ошибка при обработке запроса",
-                "detail": "Внутренняя ошибка сервера"
+                "error": "Error processing request",
+                "detail": "Internal server error"
             }
         )
 
@@ -645,14 +680,14 @@ async def query_documentation(query: Query, request: Request):
 @app.post("/escalate", responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 429: {"model": ErrorResponse}, 503: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
 async def escalate_issue(payload: EscalateRequest, request: Request):
     """
-    Endpoint для эскалации в службу поддержки (Zoho Desk).
+    Escalation endpoint to support service (Zoho Desk).
     
-    Требует, чтобы исходный запрос имел not_found=true.
+    Requires that original request had not_found=true.
     """
     request_id = getattr(request.state, "request_id", "unknown")
     client_ip = request.client.host if request.client else "unknown"
 
-    # Rate limiting по IP
+    # Rate limiting by IP
     allowed, error_msg = escalate_limiter.is_allowed(client_ip)
     if not allowed:
         if PROMETHEUS_AVAILABLE and rate_limit_hits_total is not None:
@@ -665,7 +700,7 @@ async def escalate_issue(payload: EscalateRequest, request: Request):
 
     db_sessionmaker = getattr(request.app.state, "db_sessionmaker", None)
     if db_sessionmaker is None:
-        logger.error("[%s] DATABASE_URL не настроен, эскалация недоступна", request_id)
+        logger.error("[%s] DATABASE_URL not configured, escalation unavailable", request_id)
         return JSONResponse(
             status_code=503,
             content={
@@ -674,7 +709,7 @@ async def escalate_issue(payload: EscalateRequest, request: Request):
             },
         )
 
-    # Ищем соответствующую запись QueryLog
+    # Search for corresponding QueryLog record
     from sqlalchemy import select
     from app.infra.models import QueryLog
     from sqlalchemy.exc import SQLAlchemyError
@@ -686,7 +721,7 @@ async def escalate_issue(payload: EscalateRequest, request: Request):
             )
             query_log = result.scalar_one_or_none()
     except SQLAlchemyError as e:
-        logger.error("[%s] Ошибка при поиске QueryLog для эскалации: %s", request_id, e, exc_info=True)
+        logger.error("[%s] Error searching QueryLog for escalation: %s", request_id, e, exc_info=True)
         await log_escalation(
             db_sessionmaker,
             request_id=payload.request_id,
@@ -736,8 +771,14 @@ async def escalate_issue(payload: EscalateRequest, request: Request):
             },
         )
 
-    # Формируем subject и description для тикета
-    question = query_log.question or ""
+    # Constants for limiting text length in ticket
+    TICKET_TEXT_LIMIT = 8000  # Maximum length answer in ticket
+    QUESTION_LIMIT = 2000  # Maximum length question in ticket
+    COMMENT_LIMIT = 2000  # Maximum length comment in ticket
+
+    # Form subject and description for ticket
+    question = (query_log.question or "")[:QUESTION_LIMIT]
+    answer_text = (query_log.answer or "[no answer captured]")[:TICKET_TEXT_LIMIT]
     subject = f"Aqtra Docs: {question[:80] or 'User escalation'}"
 
     parts = [
@@ -745,19 +786,40 @@ async def escalate_issue(payload: EscalateRequest, request: Request):
         f"Request ID: {payload.request_id}",
         "",
         f"Question: {question}",
+        f"Answer: {answer_text}",
         f"Not found: {query_log.not_found}",
         f"Page URL: {query_log.page_url or '-'}",
         f"Page Title: {query_log.page_title or '-'}",
         "",
-        f"Sources: {query_log.sources or '[]'}",
     ]
+
+    # Format sources in readable form
+    sources = query_log.sources
+    if not sources:
+        parts.append("Sources: -")
+    else:
+        parts.append("Sources:")
+        try:
+            for source in sources:
+                title = source.get("section_title") or source.get("title") or source.get("source", "Unknown")
+                url = source.get("url") or "-"
+                score = source.get("score")
+                if score is not None:
+                    parts.append(f"- {title} — {url} (score={score:.3f})")
+                else:
+                    parts.append(f"- {title} — {url}")
+        except (TypeError, AttributeError, KeyError):
+            # Fallback if sources in unexpected format
+            parts.append(f"Sources: {sources}")
+
     if payload.comment:
+        comment_text = (payload.comment or "")[:COMMENT_LIMIT]
         parts.append("")
-        parts.append(f"User comment: {payload.comment}")
+        parts.append(f"User comment: {comment_text}")
 
     description = "\n".join(parts)
 
-    # Создаем тикет в Zoho Desk
+    # Create ticket in Zoho Desk
     zoho_ticket_id = None
     zoho_ticket_number = None
 
@@ -786,7 +848,7 @@ async def escalate_issue(payload: EscalateRequest, request: Request):
             "ticket_number": zoho_ticket_number,
         }
     except Exception as e:
-        logger.error("[%s] Ошибка при создании тикета Zoho Desk: %s", request_id, e, exc_info=True)
+        logger.error("[%s] Error creating ticket Zoho Desk: %s", request_id, e, exc_info=True)
         await log_escalation(
             db_sessionmaker,
             request_id=payload.request_id,
@@ -809,22 +871,22 @@ async def update_index(
     x_api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
     """
-    Endpoint для принудительного обновления векторного индекса.
+    Endpoint for forced vector index update.
     
-    Защищен API ключом. Пересоздает индекс один раз и обновляет app.state.
-    Поддерживает rate limiting и метрики.
+    Protected by API key. Recreates index once and updates app.state.
+    Supports rate limiting and metrics.
     
     Args:
-        request: FastAPI Request для доступа к app.state
-        x_api_key: API ключ в заголовке X-API-Key
+        request: FastAPI Request for accessing app.state
+        x_api_key: API key in X-API-Key header
         
     Returns:
-        JSON с результатом обновления индекса
+        JSON with index update result
     """
     request_id = getattr(request.state, "request_id", "unknown")
     start_time = time()
     
-    # Rate limiting по API ключу или IP
+    # Rate limiting by API key or IP
     limiter_key = x_api_key or (request.client.host if request.client else "unknown")
     allowed, error_msg = update_limiter.is_allowed(limiter_key)
     if not allowed:
@@ -836,58 +898,58 @@ async def update_index(
             content={"error": "Rate limit exceeded", "detail": error_msg}
         )
     
-    # Проверяем API ключ
+    # Check API key
     required_api_key = os.getenv("UPDATE_API_KEY")
     if not required_api_key:
-        logger.warning(f"[{request_id}] UPDATE_API_KEY не установлен в .env")
+        logger.warning(f"[{request_id}] UPDATE_API_KEY not set in .env")
         return JSONResponse(
             status_code=503,
             content={
-                "error": "Endpoint недоступен",
-                "detail": "UPDATE_API_KEY не настроен"
+                "error": "Endpoint unavailable",
+                "detail": "UPDATE_API_KEY not configured"
             }
         )
     
     if not x_api_key or x_api_key != required_api_key:
-        logger.warning(f"[{request_id}] Неверный API ключ для обновления индекса")
+        logger.warning(f"[{request_id}] Invalid API key for index update")
         if PROMETHEUS_AVAILABLE and update_index_requests_total is not None:
             update_index_requests_total.labels(status="error").inc()
         return JSONResponse(
             status_code=401,
             content={
-                "error": "Неверный API ключ",
-                "detail": "Укажите правильный X-API-Key в заголовке запроса"
+                "error": "Invalid API key",
+                "detail": "Specify correct X-API-Key in request header"
             }
         )
     
     try:
-        logger.info(f"[{request_id}] Начато обновление индекса...")
+        logger.info(f"[{request_id}] Started index update...")
         
-        # Загружаем и чанкируем документы
+        # Load and chunk documents
         documents = load_mkdocs_documents()
         if not documents:
             return JSONResponse(
                 status_code=500,
                 content={
-                    "error": "Не найдено документов",
-                    "detail": "Убедитесь, что в data/mkdocs_docs есть .md файлы"
+                    "error": "No documents found",
+                    "detail": "Make sure that in data/mkdocs_docs has .md files"
                 }
             )
         
         chunks = chunk_documents(documents)
-        logger.info(f"Загружено {len(documents)} документов, создано {len(chunks)} чанков")
+        logger.info(f"Loaded documents, created chunks")
         
-        # Пересоздаем индекс ОДИН РАЗ
+        # Recreate index ONCE
         vectorstore = build_or_load_vectorstore(
             chunks=chunks,
             force_rebuild=True
         )
         
-        # Загружаем настройки промпта
+        # Load prompt settings
         prompt_settings = load_prompt_settings_from_env()
         
-        # Создаем новую RAG цепочку из уже пересобранного vectorstore
-        # (не вызываем get_rag_chain, чтобы избежать повторной загрузки)
+        # Create new RAG chain from already rebuilt vectorstore
+        # (do not call get_rag_chain, to avoid reloading)
         rag_chain = build_rag_chain(
             vectorstore,
             prompt_settings=prompt_settings,
@@ -895,12 +957,16 @@ async def update_index(
             temperature=prompt_settings.default_temperature
         )
         
-        # Обновляем app.state
+        # Update app.state
         request.app.state.vectorstore = vectorstore
         request.app.state.rag_chain = rag_chain
         request.app.state.prompt_settings = prompt_settings
+
+        # Cache invalidation of responses after index recreation
+        response_cache.clear()
+        logger.info("[%s] Cache cleared after update_index", request_id)
         
-        # Обновляем метрики индекса
+        # Update index metrics
         if PROMETHEUS_AVAILABLE:
             update_index_metrics(len(documents), len(chunks))
             if update_index_requests_total is not None:
@@ -908,17 +974,17 @@ async def update_index(
             if update_index_duration_seconds is not None:
                 update_index_duration_seconds.observe(time() - start_time)
         
-        logger.info(f"[{request_id}] Индекс успешно обновлен и RAG цепочка пересоздана")
+        logger.info(f"[{request_id}] Index successfully updated and RAG chain recreated")
         return {
             "status": "success",
-            "message": "Индекс успешно обновлен",
+            "message": "Index successfully updated",
             "documents_count": len(documents),
             "chunks_count": len(chunks),
             "index_size": vectorstore.index.ntotal
         }
         
     except Exception as e:
-        logger.error(f"[{request_id}] Ошибка при обновлении индекса: {e}", exc_info=True)
+        logger.error(f"[{request_id}] Error updating index: {e}", exc_info=True)
         if PROMETHEUS_AVAILABLE:
             if update_index_requests_total is not None:
                 update_index_requests_total.labels(status="error").inc()
@@ -927,25 +993,25 @@ async def update_index(
         return JSONResponse(
             status_code=500,
             content={
-                "error": "Ошибка при обновлении индекса",
-                "detail": "Внутренняя ошибка сервера"
+                "error": "Error updating index",
+                "detail": "Internal server error"
             }
         )
 
 
 if __name__ == "__main__":
     """
-    Запуск приложения через uvicorn.
+    Running application via uvicorn.
     
-    Использование:
+    Usage:
         python -m app.api.main
         
-    Или через uvicorn напрямую:
+    Or via uvicorn directly:
         uvicorn app.api.main:app --reload --port 8000
     """
     import uvicorn
     
-    # Запускаем сервер
+    # Start server
     uvicorn.run(
         "app.api.main:app",
         host="0.0.0.0",

@@ -1,30 +1,30 @@
 """
-Опциональный скрипт для обновления векторного индекса.
+Optional script for updating vector index.
 
-Использование:
+Usage:
     python update_index.py
 
-Этот скрипт:
-1. Загружает все .md файлы из data/mkdocs_docs
-2. Разбивает их на чанки
-3. Пересоздает векторный индекс FAISS
-4. Сохраняет индекс в vectorstore/faiss_index
+This script:
+1. Loads all .md files from data/mkdocs_docs
+2. Splits them into chunks
+3. Recreates FAISS vector index
+4. Saves index to vectorstore/faiss_index
 
-Альтернатива: использовать endpoint /update_index через API.
+Alternative: use /update_index endpoint via API.
 """
 
 import logging
 import sys
 from pathlib import Path
 
-# Добавляем корневую директорию проекта в путь
+# Add project root directory to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from dotenv import load_dotenv
 from app.core.rag_chain import build_or_load_vectorstore, chunk_documents, load_mkdocs_documents
 
-# Настройка логирования
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -33,46 +33,46 @@ logger = logging.getLogger(__name__)
 
 
 def main():
-    """Основная функция для обновления индекса."""
-    # Загружаем переменные окружения
+    """Main function for updating index."""
+    # Load environment variables
     load_dotenv()
     
     logger.info("=" * 60)
-    logger.info("ОБНОВЛЕНИЕ ВЕКТОРНОГО ИНДЕКСА")
+    logger.info("UPDATING VECTOR INDEX")
     logger.info("=" * 60)
     
     try:
-        # Загружаем документы
-        logger.info("Загрузка документов из data/mkdocs_docs...")
+        # Load documents
+        logger.info("Loading documents from data/mkdocs_docs...")
         documents = load_mkdocs_documents()
         
         if not documents:
-            logger.error("Не найдено документов для индексации")
-            logger.error("Убедитесь, что в data/mkdocs_docs есть .md файлы")
+            logger.error("No documents found for indexing")
+            logger.error("Make sure data/mkdocs_docs contains .md files")
             sys.exit(1)
         
-        logger.info(f"Загружено {len(documents)} документов")
+        logger.info(f"Loaded {len(documents)} documents")
         
-        # Разбиваем на чанки
-        logger.info("Разбиение документов на чанки...")
+        # Split into chunks
+        logger.info("Splitting documents into chunks...")
         chunks = chunk_documents(documents)
-        logger.info(f"Создано {len(chunks)} чанков")
+        logger.info(f"Created {len(chunks)} chunks")
         
-        # Пересоздаем индекс
-        logger.info("Создание векторного индекса...")
+        # Recreate index
+        logger.info("Creating vector index...")
         vectorstore = build_or_load_vectorstore(
             chunks=chunks,
             force_rebuild=True
         )
         
         logger.info("=" * 60)
-        logger.info("Индекс успешно обновлен!")
-        logger.info(f"Количество документов в индексе: {vectorstore.index.ntotal}")
-        logger.info(f"Размерность векторов: {vectorstore.index.d}")
+        logger.info("Index successfully updated!")
+        logger.info(f"Number of documents in index: {vectorstore.index.ntotal}")
+        logger.info(f"Vector dimension: {vectorstore.index.d}")
         logger.info("=" * 60)
         
     except Exception as e:
-        logger.error(f"Ошибка при обновлении индекса: {e}", exc_info=True)
+        logger.error(f"Error updating index: {e}", exc_info=True)
         sys.exit(1)
 
 

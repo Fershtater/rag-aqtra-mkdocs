@@ -30,6 +30,7 @@ class QueryLog(Base):
     page_title: Mapped[Optional[str]] = mapped_column(Text)
 
     question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[Optional[str]] = mapped_column(Text)
     not_found: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     cache_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 

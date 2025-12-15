@@ -5,7 +5,7 @@
     "question": "How does the Label UI component work in Aqtra and when should I use it instead of plain text?",
     "expectations": {
       "must_contain": ["label"],
-      "must_not_contain": ["not found", "Информация не найдена"],
+      "must_not_contain": ["not found", "Information not found"],
       "required_sources": ["app-development/ui-components/label"]
     }
   },
@@ -15,38 +15,8 @@
     "question": "What does the Button UI component do in Aqtra, and in which cases should I use a primary versus a secondary button?",
     "expectations": {
       "must_contain": ["button", "action"],
-      "must_not_contain": ["not found", "Информация не найдена"],
+      "must_not_contain": ["not found", "Information not found"],
       "required_sources": ["app-development/ui-components/button"]
-    }
-  },
-  {
-    "id": "data_grid_ru",
-    "description": "Russian question about DataGrid capabilities and examples should be answered using DataGrid docs",
-    "question": "Как работать с DataGrid в приложении Aqtra: какие у него основные возможности и приведите примеры типичных сценариев использования?",
-    "expectations": {
-      "must_contain": ["data grid"],
-      "must_not_contain": ["Информация не найдена", "not found"],
-      "required_sources": ["app-development/ui-components/data-grid"]
-    }
-  },
-  {
-    "id": "dataflow_ru",
-    "description": "Russian question about Dataflow concept and its capabilities should be answered using Dataflow docs",
-    "question": "Расскажи, что такое Dataflow в Aqtra, для чего он используется и какие основные возможности он предоставляет.",
-    "expectations": {
-      "must_contain": ["data flow"],
-      "must_not_contain": ["Информация не найдена", "not found"],
-      "required_sources": ["app-development/data-flow-components/index"]
-    }
-  },
-  {
-    "id": "negative_out_of_scope_ru",
-    "description": "Out-of-scope Russian question should clearly indicate information is not found and not return any Aqtra docs sources",
-    "question": "Как развернуть Aqtra на Марсе?",
-    "expectations": {
-      "must_contain": ["не найдена"],
-      "must_not_contain": [],
-      "required_sources": []
     }
   },
   {
