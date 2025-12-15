@@ -29,10 +29,14 @@ class LRUCache:
         self.ttl_seconds = ttl_seconds
         self.cache: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
     
-    def _generate_key(self, question: str, top_k: int, temperature: float, settings_signature: str) -> str:
-        """Генерирует ключ кэша."""
+    def _generate_key(self, question: str, settings_signature: str) -> str:
+        """Генерирует ключ кэша.
+        
+        Ключ завязан только на текст вопроса и сигнатуру настроек промпта,
+        чтобы избежать взрывного роста кэша из-за per-request параметров.
+        """
         normalized_question = question.strip().lower()[:500]  # Ограничиваем длину
-        key_data = f"{normalized_question}|{top_k}|{round(temperature, 2)}|{settings_signature}"
+        key_data = f"{normalized_question}|{settings_signature}"
         return hashlib.md5(key_data.encode()).hexdigest()
     
     def get(self, key: str) -> Optional[Any]:

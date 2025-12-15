@@ -54,18 +54,18 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, EmailStr, Field, validator
 
 from app.core.rag_chain import (
     build_or_load_vectorstore,
     build_rag_chain,
     build_rag_chain_and_settings,
     chunk_documents,
-    load_mkdocs_documents
+    load_mkdocs_documents,
 )
 from app.core.prompt_config import load_prompt_settings_from_env
 from app.core.markdown_utils import build_doc_url
-from app.infra.rate_limit import query_limiter, update_limiter
+from app.infra.rate_limit import query_limiter, update_limiter, escalate_limiter
 from app.infra.cache import response_cache
 from app.infra.metrics import (
     get_metrics_response,
@@ -75,8 +75,11 @@ from app.infra.metrics import (
     rate_limit_hits_total,
     query_latency_seconds,
     update_index_duration_seconds,
-    PROMETHEUS_AVAILABLE
+    PROMETHEUS_AVAILABLE,
 )
+from app.infra.db import init_db, get_sessionmaker
+from app.infra.analytics import hash_ip, log_query, log_escalation
+from app.infra.zoho_desk import create_ticket
 
 # Загружаем переменные окружения из .env файла
 load_dotenv()
@@ -109,9 +112,8 @@ logger.info("✓ OPENAI_API_KEY найден в переменных окруж�
 class Query(BaseModel):
     """Модель запроса пользователя."""
     question: str = Field(..., max_length=2000, description="Вопрос пользователя (макс. 2000 символов)")
-    top_k: Optional[int] = Field(None, ge=1, le=10, description="Количество чанков для поиска (1-10)")
-    temperature: Optional[float] = Field(None, ge=0.0, le=1.0, description="Температура LLM (0.0-1.0)")
-    max_tokens: Optional[int] = Field(None, ge=128, le=2048, description="Максимальное количество токенов (128-2048)")
+    page_url: Optional[str] = Field(None, description="URL страницы, с которой задан вопрос")
+    page_title: Optional[str] = Field(None, description="Заголовок страницы, с которой задан вопрос")
     
     @validator('question')
     def validate_question_length(cls, v):
@@ -133,6 +135,10 @@ class QueryResponse(BaseModel):
     """Модель ответа RAG-системы."""
     answer: str
     sources: List[Dict[str, str]]
+    not_found: bool
+    request_id: str
+    latency_ms: int
+    cache_hit: bool
     
     class Config:
         json_schema_extra = {
@@ -175,6 +181,7 @@ def calculate_effective_top_k(question: str, base_top_k: int, mode: str) -> int:
 
 class ErrorResponse(BaseModel):
     """Модель ответа с ошибкой."""
+
     error: str
     detail: Optional[str] = None
 
@@ -215,6 +222,21 @@ async def lifespan(app: FastAPI):
         app.state.vectorstore = None
         app.state.rag_chain = None
         app.state.prompt_settings = None
+
+    # Инициализируем БД для логирования, если настроен DATABASE_URL
+    db_url = os.getenv("DATABASE_URL")
+    if db_url:
+        try:
+            logger.info("Инициализирую подключение к БД для логирования...")
+            db_sessionmaker = await init_db(db_url)
+            app.state.db_sessionmaker = db_sessionmaker
+            logger.info("Подключение к БД успешно инициализировано")
+        except Exception as e:
+            logger.error("Не удалось инициализировать БД: %s", e, exc_info=True)
+            app.state.db_sessionmaker = None
+    else:
+        logger.info("DATABASE_URL не задан, логирование в БД отключено")
+        app.state.db_sessionmaker = None
     
     yield
     
@@ -223,6 +245,7 @@ async def lifespan(app: FastAPI):
     app.state.vectorstore = None
     app.state.rag_chain = None
     app.state.prompt_settings = None
+    app.state.db_sessionmaker = None
 
 
 # Создаем FastAPI приложение с lifespan
@@ -384,82 +407,54 @@ async def query_documentation(query: Query, request: Request):
         prompt_settings = getattr(request.app.state, "prompt_settings", None)
         if prompt_settings is None:
             prompt_settings = load_prompt_settings_from_env()
-        
-        # Вычисляем базовые значения из запроса или настроек
-        base_top_k = query.top_k if query.top_k is not None else prompt_settings.default_top_k
-        effective_temperature = query.temperature if query.temperature is not None else prompt_settings.default_temperature
-        # Если max_tokens не передан, используем значение из PromptSettings (если оно есть)
-        effective_max_tokens = query.max_tokens if query.max_tokens is not None else getattr(
-            prompt_settings, "default_max_tokens", None
-        )
-        
-        # Безопасная валидация диапазонов
-        base_top_k = max(1, min(10, base_top_k))
-        effective_temperature = max(0.0, min(1.0, effective_temperature))
-        if effective_max_tokens is not None:
-            clamped_max_tokens = max(128, min(2048, effective_max_tokens))
-            if clamped_max_tokens != effective_max_tokens:
-                logger.debug(
-                    "[%s] max_tokens=%s откорректирован до безопасного диапазона (%s)",
-                    request_id,
-                    effective_max_tokens,
-                    clamped_max_tokens,
-                )
-            effective_max_tokens = clamped_max_tokens
 
-        # Адаптивный top_k по длине вопроса
-        effective_top_k = calculate_effective_top_k(
-            question=query.question,
-            base_top_k=base_top_k,
-            mode=prompt_settings.mode,
+        # Сигнатура настроек для кэша: фиксируем только стабильные параметры
+        settings_signature = (
+            f"{prompt_settings.language}_"
+            f"{prompt_settings.mode}_"
+            f"{prompt_settings.default_top_k}_"
+            f"{prompt_settings.default_temperature}_"
+            f"{getattr(prompt_settings, 'default_max_tokens', None)}"
         )
-        
+
         # Генерируем ключ кэша
-        settings_signature = f"{prompt_settings.language}_{prompt_settings.mode}"
-        cache_key = response_cache._generate_key(
-            query.question,
-            effective_top_k,
-            effective_temperature,
-            settings_signature
-        )
-        
+        cache_key = response_cache._generate_key(query.question, settings_signature)
+
         # Проверяем кэш
-        cached_result = response_cache.get(cache_key)
+        cached_result: Optional[QueryResponse] = response_cache.get(cache_key)
+        cache_hit = cached_result is not None
+
         if cached_result:
             logger.debug(f"[{request_id}] Cache hit for query")
+            latency = int((time() - start_time) * 1000)
             if PROMETHEUS_AVAILABLE and query_requests_total is not None:
                 query_requests_total.labels(status="success").inc()
-                query_latency_seconds.observe(time() - start_time)
+                query_latency_seconds.observe(latency / 1000.0)
+
+            # Логируем запрос даже при cache hit
+            db_sessionmaker = getattr(request.app.state, "db_sessionmaker", None)
+            sources = cached_result.sources or []
+            not_found_flag = cached_result.not_found
+            ip_hash_value = hash_ip(client_ip)
+            user_agent = request.headers.get("User-Agent")
+
+            await log_query(
+                db_sessionmaker,
+                request_id=request_id,
+                ip_hash_value=ip_hash_value,
+                user_agent=user_agent,
+                page_url=query.page_url,
+                page_title=query.page_title,
+                question=query.question,
+                not_found=not_found_flag,
+                cache_hit=True,
+                latency_ms=latency,
+                sources=sources,
+                error=None,
+            )
+
             return cached_result
-        
-        # Если параметры отличаются от дефолтных, создаем новую цепочку с этими параметрами
-        vectorstore = getattr(request.app.state, "vectorstore", None)
-        if vectorstore is None:
-            logger.error(f"[{request_id}] Vectorstore не найден в app.state")
-            if PROMETHEUS_AVAILABLE and query_requests_total is not None:
-                query_requests_total.labels(status="error").inc()
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "Vectorstore не инициализирован",
-                    "detail": "Попробуйте позже или проверьте логи приложения"
-                }
-            )
-        
-        # Если параметры отличаются от дефолтных, создаем временную цепочку
-        if effective_top_k != prompt_settings.default_top_k or effective_temperature != prompt_settings.default_temperature or effective_max_tokens is not None:
-            logger.debug(f"[{request_id}] Создаю временную цепочку с top_k={effective_top_k}, temperature={effective_temperature}")
-            # TODO: Добавить поддержку max_tokens в build_rag_chain для динамического применения
-            temp_rag_chain = await asyncio.to_thread(
-                build_rag_chain,
-                vectorstore,
-                prompt_settings=prompt_settings,
-                k=effective_top_k,
-                temperature=effective_temperature,
-                max_tokens=effective_max_tokens
-            )
-            rag_chain = temp_rag_chain
-        
+
         # Вызываем RAG цепочку с вопросом пользователя асинхронно
         try:
             result = await asyncio.to_thread(rag_chain.invoke, {"input": query.question})
@@ -551,21 +546,61 @@ async def query_documentation(query: Query, request: Request):
                         )
                     sources.append(source_info)
         
+        # Определяем not_found по сообщению и/или отсутствию источников
+        not_found_flag = (
+            answer.strip() == prompt_settings.not_found_message.strip()
+            or len(sources) == 0
+        )
+
+        latency_sec = time() - start_time
+        latency_ms = int(latency_sec * 1000)
+
         # Формируем ответ
         response = QueryResponse(
             answer=answer,
-            sources=sources
+            sources=sources,
+            not_found=not_found_flag,
+            request_id=request_id,
+            latency_ms=latency_ms,
+            cache_hit=False,
         )
-        
+
         # Сохраняем в кэш
         response_cache.set(cache_key, response)
-        
+
         # Обновляем метрики
         if PROMETHEUS_AVAILABLE and query_requests_total is not None:
             query_requests_total.labels(status="success").inc()
-            query_latency_seconds.observe(time() - start_time)
-        
-        logger.info(f"[{request_id}] Запрос обработан успешно, источников: {len(sources)}")
+            query_latency_seconds.observe(latency_sec)
+
+        # Логируем в БД (если доступно)
+        db_sessionmaker = getattr(request.app.state, "db_sessionmaker", None)
+        ip_hash_value = hash_ip(client_ip)
+        user_agent = request.headers.get("User-Agent")
+
+        await log_query(
+            db_sessionmaker,
+            request_id=request_id,
+            ip_hash_value=ip_hash_value,
+            user_agent=user_agent,
+            page_url=query.page_url,
+            page_title=query.page_title,
+            question=query.question,
+            not_found=not_found_flag,
+            cache_hit=False,
+            latency_ms=latency_ms,
+            sources=sources,
+            error=None,
+        )
+
+        logger.info(
+            "[%s] Запрос обработан успешно, источников: %s, not_found=%s, cache_hit=%s, latency_ms=%s",
+            request_id,
+            len(sources),
+            not_found_flag,
+            False,
+            latency_ms,
+        )
         return response
         
     except Exception as e:
@@ -573,12 +608,198 @@ async def query_documentation(query: Query, request: Request):
         if PROMETHEUS_AVAILABLE and query_requests_total is not None:
             query_requests_total.labels(status="error").inc()
             query_latency_seconds.observe(time() - start_time)
+
+        # Пытаемся залогировать ошибку запроса
+        try:
+            db_sessionmaker = getattr(request.app.state, "db_sessionmaker", None)
+            ip_hash_value = hash_ip(client_ip)
+            user_agent = request.headers.get("User-Agent")
+            latency_ms = int((time() - start_time) * 1000)
+
+            await log_query(
+                db_sessionmaker,
+                request_id=request_id,
+                ip_hash_value=ip_hash_value,
+                user_agent=user_agent,
+                page_url=query.page_url,
+                page_title=query.page_title,
+                question=query.question,
+                not_found=False,
+                cache_hit=False,
+                latency_ms=latency_ms,
+                sources=[],
+                error=str(e),
+            )
+        except Exception:
+            # Логирование ошибок логирования опускаем, чтобы не маскировать основную ошибку
+            pass
         return JSONResponse(
             status_code=500,
             content={
                 "error": "Ошибка при обработке запроса",
                 "detail": "Внутренняя ошибка сервера"
             }
+        )
+
+
+@app.post("/escalate", responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 429: {"model": ErrorResponse}, 503: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
+async def escalate_issue(payload: EscalateRequest, request: Request):
+    """
+    Endpoint для эскалации в службу поддержки (Zoho Desk).
+    
+    Требует, чтобы исходный запрос имел not_found=true.
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Rate limiting по IP
+    allowed, error_msg = escalate_limiter.is_allowed(client_ip)
+    if not allowed:
+        if PROMETHEUS_AVAILABLE and rate_limit_hits_total is not None:
+            rate_limit_hits_total.labels(endpoint="escalate").inc()
+        logger.warning("[%s] Escalate rate limit exceeded for %s", request_id, client_ip)
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Rate limit exceeded", "detail": error_msg},
+        )
+
+    db_sessionmaker = getattr(request.app.state, "db_sessionmaker", None)
+    if db_sessionmaker is None:
+        logger.error("[%s] DATABASE_URL не настроен, эскалация недоступна", request_id)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "Escalation is not configured",
+                "detail": "DATABASE_URL is not set on the server",
+            },
+        )
+
+    # Ищем соответствующую запись QueryLog
+    from sqlalchemy import select
+    from app.infra.models import QueryLog
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        async with db_sessionmaker() as session:
+            result = await session.execute(
+                select(QueryLog).where(QueryLog.request_id == payload.request_id)
+            )
+            query_log = result.scalar_one_or_none()
+    except SQLAlchemyError as e:
+        logger.error("[%s] Ошибка при поиске QueryLog для эскалации: %s", request_id, e, exc_info=True)
+        await log_escalation(
+            db_sessionmaker,
+            request_id=payload.request_id,
+            email=payload.email,
+            status="db_error",
+            error=str(e),
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Database error",
+                "detail": "Failed to load query log for escalation",
+            },
+        )
+
+    if query_log is None:
+        logger.warning("[%s] QueryLog not found for request_id=%s", request_id, payload.request_id)
+        await log_escalation(
+            db_sessionmaker,
+            request_id=payload.request_id,
+            email=payload.email,
+            status="not_found",
+            error="QueryLog not found",
+        )
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "Query not found",
+                "detail": "Cannot escalate request that is not logged",
+            },
+        )
+
+    if not query_log.not_found:
+        logger.warning("[%s] Escalation requested for non-not-found query_id=%s", request_id, payload.request_id)
+        await log_escalation(
+            db_sessionmaker,
+            request_id=payload.request_id,
+            email=payload.email,
+            status="rejected",
+            error="Escalation allowed only for not_found queries",
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "Escalation not allowed",
+                "detail": "Escalation is allowed only when the original answer was not_found",
+            },
+        )
+
+    # Формируем subject и description для тикета
+    question = query_log.question or ""
+    subject = f"Aqtra Docs: {question[:80] or 'User escalation'}"
+
+    parts = [
+        f"User email: {payload.email}",
+        f"Request ID: {payload.request_id}",
+        "",
+        f"Question: {question}",
+        f"Not found: {query_log.not_found}",
+        f"Page URL: {query_log.page_url or '-'}",
+        f"Page Title: {query_log.page_title or '-'}",
+        "",
+        f"Sources: {query_log.sources or '[]'}",
+    ]
+    if payload.comment:
+        parts.append("")
+        parts.append(f"User comment: {payload.comment}")
+
+    description = "\n".join(parts)
+
+    # Создаем тикет в Zoho Desk
+    zoho_ticket_id = None
+    zoho_ticket_number = None
+
+    try:
+        ticket_response = await create_ticket(
+            email=payload.email,
+            subject=subject,
+            description=description,
+        )
+        zoho_ticket_id = str(ticket_response.get("id") or "")
+        zoho_ticket_number = str(ticket_response.get("ticketNumber") or "")
+
+        await log_escalation(
+            db_sessionmaker,
+            request_id=payload.request_id,
+            email=payload.email,
+            status="success",
+            zoho_ticket_id=zoho_ticket_id or None,
+            zoho_ticket_number=zoho_ticket_number or None,
+            error=None,
+        )
+
+        return {
+            "status": "success",
+            "ticket_id": zoho_ticket_id,
+            "ticket_number": zoho_ticket_number,
+        }
+    except Exception as e:
+        logger.error("[%s] Ошибка при создании тикета Zoho Desk: %s", request_id, e, exc_info=True)
+        await log_escalation(
+            db_sessionmaker,
+            request_id=payload.request_id,
+            email=payload.email,
+            status="error",
+            error=str(e),
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "Escalation failed",
+                "detail": "Failed to create ticket in Zoho Desk",
+            },
         )
 
 

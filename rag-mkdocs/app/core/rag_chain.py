@@ -16,7 +16,7 @@ from langchain_community.document_loaders import TextLoader
 from app.core.prompt_config import (
     PromptSettings,
     load_prompt_settings_from_env,
-    build_system_prompt
+    build_system_prompt,
 )
 try:
     # Для LangChain >= 1.0
@@ -34,6 +34,7 @@ from app.infra.openai_utils import get_embeddings_client, get_chat_llm
 try:
     from langchain.retrievers import ContextualCompressionRetriever
     from langchain.retrievers.document_compressors import LLMChainExtractor
+
     RERANKING_AVAILABLE = True
 except ImportError:
     RERANKING_AVAILABLE = False
@@ -80,6 +81,9 @@ else:
 DEFAULT_CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
 DEFAULT_CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
 DEFAULT_MIN_CHUNK_SIZE = int(os.getenv("MIN_CHUNK_SIZE", "200"))
+
+# Управление LLM-based reranking.
+RERANKING_ENABLED = os.getenv("RERANKING_ENABLED", "0").lower() in ("1", "true", "yes")
 
 
 def load_mkdocs_documents(docs_path: str = "data/mkdocs_docs") -> List[Document]:
@@ -523,46 +527,50 @@ def build_rag_chain(
     effective_temperature = temperature if temperature is not None else prompt_settings.default_temperature
     # Если max_tokens не передан явно, используем настройку по умолчанию из PromptSettings
     effective_max_tokens = max_tokens if max_tokens is not None else prompt_settings.default_max_tokens
-    
+
     # Ограничиваем диапазоны
     effective_k = max(1, min(10, effective_k))
     effective_temperature = max(0.0, min(1.0, effective_temperature))
     if effective_max_tokens is not None:
         effective_max_tokens = max(128, min(4096, effective_max_tokens))
-    
-    # Создаем базовый retriever с увеличенным k для reranking
-    raw_k = max(effective_k * 2, 8)
-    logger.info(f"Создаю базовый retriever с k={raw_k} для reranking...")
-    base_retriever = vectorstore.as_retriever(search_kwargs={"k": raw_k})
-    
-    # Применяем reranking через ContextualCompressionRetriever
+
+    # Создаем базовый retriever
+    if RERANKING_ENABLED:
+        raw_k = max(effective_k * 2, 8)
+        logger.info("Создаю базовый retriever с k=%s для reranking...", raw_k)
+        base_retriever = vectorstore.as_retriever(search_kwargs={"k": raw_k})
+    else:
+        logger.info("Reranking отключен, используем базовый retriever с k=%s", effective_k)
+        base_retriever = vectorstore.as_retriever(search_kwargs={"k": effective_k})
+
+    # Применяем reranking через ContextualCompressionRetriever (опционально)
     logger.info(
-        "Инициализирую LLM для reranking: %s (temperature=%s, max_tokens=%s)...",
+        "Инициализирую LLM для retriever: %s (temperature=%s, max_tokens=%s, reranking_enabled=%s)...",
         model,
         effective_temperature,
         effective_max_tokens,
+        RERANKING_ENABLED,
     )
     llm = get_chat_llm(
         temperature=effective_temperature,
         model=model,
         max_tokens=effective_max_tokens,
     )
-    
-    # Используем LLMChainExtractor для фильтрации менее релевантных чанков
-    if RERANKING_AVAILABLE:
+
+    if RERANKING_ENABLED and RERANKING_AVAILABLE:
         try:
             compressor = LLMChainExtractor.from_llm(llm)
             retriever = ContextualCompressionRetriever(
                 base_compressor=compressor,
-                base_retriever=base_retriever
+                base_retriever=base_retriever,
             )
-            logger.info(f"Reranking включен, финальный k={effective_k}")
+            logger.info("Reranking включен, финальный k=%s", effective_k)
         except Exception as e:
-            logger.warning(f"Ошибка при создании reranker: {e}, используем базовый retriever")
+            logger.warning("Ошибка при создании reranker: %s, используем базовый retriever", e)
             retriever = vectorstore.as_retriever(search_kwargs={"k": effective_k})
     else:
-        # Fallback если ContextualCompressionRetriever недоступен
-        logger.info("Reranking недоступен, используем базовый retriever")
+        if RERANKING_ENABLED and not RERANKING_AVAILABLE:
+            logger.info("Reranking запрошен, но недоступен в текущей версии LangChain; используем базовый retriever")
         retriever = vectorstore.as_retriever(search_kwargs={"k": effective_k})
     
     # Собираем system prompt из настроек

@@ -15,6 +15,8 @@ QUERY_RATE_LIMIT = int(os.getenv("QUERY_RATE_LIMIT", "30"))
 QUERY_RATE_WINDOW_SECONDS = int(os.getenv("QUERY_RATE_WINDOW_SECONDS", "60"))
 UPDATE_RATE_LIMIT = int(os.getenv("UPDATE_RATE_LIMIT", "3"))
 UPDATE_RATE_WINDOW_SECONDS = int(os.getenv("UPDATE_RATE_WINDOW_SECONDS", "3600"))
+ESCALATE_RATE_LIMIT = int(os.getenv("ESCALATE_RATE_LIMIT", "5"))
+ESCALATE_RATE_WINDOW_SECONDS = int(os.getenv("ESCALATE_RATE_WINDOW_SECONDS", "3600"))
 
 
 class RateLimiter:
@@ -87,4 +89,5 @@ class RateLimiter:
 # Глобальные экземпляры лимитеров
 query_limiter = RateLimiter(QUERY_RATE_LIMIT, QUERY_RATE_WINDOW_SECONDS)
 update_limiter = RateLimiter(UPDATE_RATE_LIMIT, UPDATE_RATE_WINDOW_SECONDS)
+escalate_limiter = RateLimiter(ESCALATE_RATE_LIMIT, ESCALATE_RATE_WINDOW_SECONDS)
 
