@@ -275,7 +275,7 @@ def _compute_docs_hash(docs_path: str) -> str:
     Returns:
         SHA256 hash of all files as string
     """
-    project_root = Path(__file__).parent.parent
+    project_root = Path(__file__).parent.parent.parent
     full_docs_path = project_root / docs_path
     
     if not full_docs_path.exists():
@@ -305,7 +305,7 @@ def _save_index_hash(index_path: str, docs_hash: str) -> None:
         index_path: Path to directory with index
         docs_hash: Document hash to save
     """
-    project_root = Path(__file__).parent.parent
+    project_root = Path(__file__).parent.parent.parent
     full_index_path = project_root / index_path
     hash_file = full_index_path / ".docs_hash"
     
@@ -326,7 +326,7 @@ def _load_index_hash(index_path: str) -> Optional[str]:
     Returns:
         Document hash or None if file not found
     """
-    project_root = Path(__file__).parent.parent
+    project_root = Path(__file__).parent.parent.parent
     full_index_path = project_root / index_path
     hash_file = full_index_path / ".docs_hash"
     
@@ -390,7 +390,7 @@ def build_or_load_vectorstore(
     logger.info("=" * 60)
     
     # Determine absolute path to index
-    project_root = Path(__file__).parent.parent
+    project_root = Path(__file__).parent.parent.parent
     full_index_path = project_root / index_path
     
     # Check index existence
