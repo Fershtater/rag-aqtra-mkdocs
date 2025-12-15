@@ -26,9 +26,7 @@ ENV/
 Thumbs.db
 
 # Vectorstore files
-vectorstore/*.index
-vectorstore/*.pkl
-vectorstore/.docs_hash
+vectorstore/faiss_index/
 
 # Logs
 *.log

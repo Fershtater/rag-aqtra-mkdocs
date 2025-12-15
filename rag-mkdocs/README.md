@@ -118,17 +118,34 @@ At a high level, the service consists of:
 rag-mkdocs/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py          # FastAPI application (API endpoints, logging, app.state)
-│   └── rag_chain.py     # RAG pipeline, indexing logic, FAISS integration
+│   ├── api/
+│   │   └── main.py               # FastAPI application (endpoints, logging, app.state)
+│   ├── core/
+│   │   ├── rag_chain.py          # RAG pipeline, indexing logic, FAISS integration
+│   │   ├── markdown_utils.py     # Markdown parsing and URL helpers
+│   │   └── prompt_config.py      # PromptSettings and system prompt builder
+│   └── infra/
+│       ├── openai_utils.py       # OpenAI clients, timeouts, retry helpers
+│       ├── cache.py              # In-memory LRU/TTL response cache
+│       ├── rate_limit.py         # In-memory rate limiting
+│       └── metrics.py            # Prometheus metrics and /metrics endpoint helpers
+├── scripts/
+│   ├── update_index.py           # CLI script to rebuild the FAISS index
+│   ├── test_api.py               # Manual API smoke tests
+│   ├── check_index.sh            # Health/index/query checks against a running server
+│   └── debug_launch.sh           # Local dev server launcher (uvicorn)
+├── tests/
+│   ├── rag_scenarios.json        # RAG regression scenarios
+│   ├── run_rag_scenarios.py      # CLI runner for regression scenarios
+│   └── test_rag_scenarios.py     # pytest wrapper for regression scenarios
 ├── data/
-│   └── mkdocs_docs/     # Aqtra MkDocs documentation (docs/ tree lives here)
+│   └── mkdocs_docs/              # Aqtra MkDocs documentation (docs/ tree lives here)
 ├── vectorstore/
-│   └── faiss_index/     # Persistent FAISS index and metadata
-├── .env.example         # Example environment configuration
-├── pyproject.toml       # Poetry configuration (source of truth for deps)
-├── requirements.txt     # Synced pip-compatible dependencies
-├── update_index.py      # CLI script to rebuild the FAISS index
-└── README.md            # This file
+│   └── .gitkeep                  # FAISS index is created at runtime under vectorstore/faiss_index/
+├── .env.example                  # Example environment configuration
+├── pyproject.toml                # Poetry configuration (source of truth for deps)
+├── requirements.txt              # Synced pip-compatible dependencies
+└── README.md                     # This file
 ```
 
 ---
@@ -181,14 +198,14 @@ LOG_LEVEL=INFO       # DEBUG/INFO/WARN/ERROR
 
 ```bash
 poetry install
-poetry run uvicorn app.main:app --reload --port 8000
+poetry run uvicorn app.api.main:app --reload --port 8000
 ```
 
 **Option B — pip**
 
 ```bash
 pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+uvicorn app.api.main:app --reload --port 8000
 ```
 
 ### 5. Provide Documentation Content
@@ -272,6 +289,17 @@ Documents are chunked with awareness of Markdown structure:
 - Sections are identified by headers (`#`, `##`, `###`)
 - Chunks preserve section context
 - Each chunk includes metadata: `section_title`, `section_level`, `section_anchor`
+
+Chunking parameters are configurable via environment variables (balanced defaults tuned for technical docs):
+
+```env
+# Chunking configuration (balanced defaults)
+CHUNK_SIZE=1500        # Target chunk size in characters
+CHUNK_OVERLAP=300      # Overlap between chunks in characters
+MIN_CHUNK_SIZE=200     # Minimum chunk size; smaller chunks are discarded
+```
+
+If not set, the service falls back to the defaults above.
 
 ### Reranking
 
@@ -425,6 +453,9 @@ PROMPT_DEFAULT_TEMPERATURE=0.0
 
 # Default number of chunks to retrieve (1-10)
 PROMPT_DEFAULT_TOP_K=4
+
+# Default max tokens for LLM answers (128-4096, balanced default ≈ 1200)
+PROMPT_DEFAULT_MAX_TOKENS=1200
 ```
 
 All variables are optional and have sensible defaults. Invalid values fall back to defaults.
@@ -459,22 +490,41 @@ The `/query` endpoint accepts optional parameters to override default settings f
 {
   "question": "How do I create an app?",
   "top_k": 6,
-  "temperature": 0.1
+  "temperature": 0.1,
+  "max_tokens": 800
 }
 ```
 
 **Parameters:**
 
-- `top_k` (optional, 1-10): Number of document chunks to retrieve. Defaults to `PROMPT_DEFAULT_TOP_K`.
+- `top_k` (optional, 1-10): Base number of document chunks to retrieve. Defaults to `PROMPT_DEFAULT_TOP_K`. The service adaptively adjusts the effective `top_k` based on question length (short questions use fewer chunks, longer questions may use up to 8–10).
 - `temperature` (optional, 0.0-1.0): LLM temperature for this request. Defaults to `PROMPT_DEFAULT_TEMPERATURE`.
-- `max_tokens` (optional, reserved for future use): Maximum tokens in response.
+- `max_tokens` (optional, 128-2048): Maximum tokens in response for this request. Defaults to `PROMPT_DEFAULT_MAX_TOKENS` from `PromptSettings`.
 
 Values outside safe ranges are automatically clamped:
 
 - `top_k`: clamped to 1-10
 - `temperature`: clamped to 0.0-1.0
+- `max_tokens`: clamped to 128-2048
 
 If parameters differ from defaults, a temporary RAG chain is created for the request. This allows fine-tuning retrieval and generation behavior without changing global settings.
+
+### Recommended Modes
+
+You can use different combinations of prompt settings to approximate common modes:
+
+- **Strict mode (more concise, highly deterministic):**
+
+  - `PROMPT_MODE=strict`
+  - `PROMPT_DEFAULT_TEMPERATURE=0.1`
+  - `PROMPT_DEFAULT_TOP_K=4`
+  - `PROMPT_DEFAULT_MAX_TOKENS=800`
+
+- **Balanced/helpful mode (more detailed answers, still grounded):**
+  - `PROMPT_MODE=helpful`
+  - `PROMPT_DEFAULT_TEMPERATURE=0.2`
+  - `PROMPT_DEFAULT_TOP_K=5`
+  - `PROMPT_DEFAULT_MAX_TOKENS=1200`
 
 ---
 
@@ -526,6 +576,55 @@ Query responses are cached in-memory with:
 - Max size: 500 entries (configurable via `CACHE_MAX_SIZE`)
 
 Cache key includes: normalized question, `top_k`, `temperature`, and prompt settings signature.
+
+---
+
+## RAG Regression Checks
+
+To make sure that core RAG behaviour is not accidentally broken by future changes, the repository includes a small set of
+**regression scenarios** under `tests/`.
+
+These scenarios are intentionally simple and focus on **invariants**, not on exact wording:
+
+- For a given question, the answer **must not** contain a “not found in documentation” message (for known flows).
+- For a given question, the answer **must** contain a “not found” message (for out-of-scope questions).
+- Certain questions are expected to retrieve sources from specific parts of the documentation tree
+  (for example, `app-development/ui-components/label` or `user-interface/localizations`).
+
+### Running the RAG server
+
+First, start the RAG service locally (for example, using Poetry):
+
+```bash
+poetry run uvicorn app.api.main:app --reload --port 8000
+```
+
+or use the provided `debug_launch.sh` helper if you prefer a single command.
+
+### Running regression scenarios via CLI
+
+With the server running, execute:
+
+```bash
+export RAG_BASE_URL=http://localhost:8000
+poetry run python tests/run_rag_scenarios.py
+```
+
+The script will:
+
+- Load scenarios from `tests/rag_scenarios.json`.
+- For each scenario, send a `POST /query` request with the specified `question`.
+- Verify:
+  - `must_contain`: all required substrings are present in the `answer` (case-insensitive).
+  - `must_not_contain`: none of the forbidden substrings are present in the `answer`.
+  - `required_sources`: each required substring appears in at least one of `source`, `url` or `section_title`.
+- Print `✔` / `❌` for each scenario and a final summary.
+- Exit with code `0` if all scenarios pass, or a non-zero code if any scenario fails.
+
+These checks are **sanity checks**, not a formal quality benchmark, but they provide a quick way to ensure that:
+
+- Known happy-path questions still resolve to the right parts of the docs.
+- Out-of-scope questions are handled with a clear “not found in documentation” style answer.
 
 ---
 
