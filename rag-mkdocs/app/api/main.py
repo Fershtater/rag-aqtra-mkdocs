@@ -80,6 +80,9 @@ from app.infra.metrics import (
 from app.infra.db import init_db
 from app.infra.analytics import hash_ip, log_query, log_escalation
 from app.infra.zoho_desk import create_ticket
+from app.api.v2_models import AnswerRequest, AnswerResponse, ErrorResponseV2, SSEEvent, ErrorPayload, MetricsPayload
+from app.api.answering import process_answer_request
+from fastapi.responses import StreamingResponse
 
 # Load environment variables from .env file
 load_dotenv()
@@ -480,7 +483,8 @@ async def query_documentation(query: Query, request: Request):
         try:
             chain_input = {
                 "input": query.question,
-                "response_language": response_language
+                "response_language": response_language,
+                "chat_history": ""  # No history for /query endpoint
             }
             result = await asyncio.to_thread(rag_chain.invoke, chain_input)
         except Exception as e:
@@ -937,7 +941,7 @@ async def update_index(
             )
         
         chunks = chunk_documents(documents)
-        logger.info(f"Loaded documents, created chunks")
+        logger.info("Loaded documents, created chunks")
         
         # Recreate index ONCE
         vectorstore = build_or_load_vectorstore(
@@ -997,6 +1001,271 @@ async def update_index(
                 "detail": "Internal server error"
             }
         )
+
+
+def validate_api_key(api_key: str) -> bool:
+    """
+    Validate API key from RAG_API_KEYS environment variable.
+    
+    Args:
+        api_key: API key to validate
+        
+    Returns:
+        True if valid or if RAG_API_KEYS is not set (open access with warning)
+    """
+    rag_api_keys_str = os.getenv("RAG_API_KEYS", "")
+    if not rag_api_keys_str:
+        logger.warning("RAG_API_KEYS not set, allowing open access (consider setting it)")
+        return True
+    
+    allowed_keys = [key.strip() for key in rag_api_keys_str.split(",") if key.strip()]
+    return api_key in allowed_keys
+
+
+@app.post("/api/answer", response_model=AnswerResponse, responses={400: {"model": ErrorResponseV2}, 401: {"model": ErrorResponseV2}, 429: {"model": ErrorResponseV2}, 503: {"model": ErrorResponseV2}, 500: {"model": ErrorResponseV2}})
+async def answer_question(request_data: AnswerRequest, request: Request):
+    """
+    DocsGPT-like answer endpoint.
+    
+    Accepts question with optional history and returns answer in v2 format.
+    Supports conversation history and caching.
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+    
+    # Validate API key
+    if not validate_api_key(request_data.api_key):
+        logger.warning(f"[{request_id}] Invalid API key")
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": "Invalid API key",
+                "detail": "API key is not authorized",
+                "request_id": request_id,
+                "code": "INVALID_API_KEY"
+            }
+        )
+    
+    # Rate limiting
+    client_ip = request.client.host if request.client else "unknown"
+    allowed, error_msg = query_limiter.is_allowed(client_ip)
+    if not allowed:
+        if PROMETHEUS_AVAILABLE and rate_limit_hits_total is not None:
+            rate_limit_hits_total.labels(endpoint="api/answer").inc()
+        logger.warning(f"[{request_id}] Rate limit exceeded for {client_ip}")
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "Rate limit exceeded",
+                "detail": error_msg,
+                "request_id": request_id,
+                "code": "RATE_LIMIT_EXCEEDED"
+            }
+        )
+    
+    # Get RAG chain from app.state
+    rag_chain = getattr(request.app.state, "rag_chain", None)
+    if rag_chain is None:
+        logger.error(f"[{request_id}] RAG chain not initialized")
+        if PROMETHEUS_AVAILABLE and query_requests_total is not None:
+            query_requests_total.labels(status="error").inc()
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "RAG chain not initialized",
+                "detail": "Please try again later or check application logs",
+                "request_id": request_id,
+                "code": "SERVICE_UNAVAILABLE"
+            }
+        )
+    
+    try:
+        # Get prompt settings
+        prompt_settings = getattr(request.app.state, "prompt_settings", None)
+        if prompt_settings is None:
+            prompt_settings = load_prompt_settings_from_env()
+        
+        # Get database sessionmaker
+        db_sessionmaker = getattr(request.app.state, "db_sessionmaker", None)
+        
+        # Get user agent
+        user_agent = request.headers.get("User-Agent")
+        
+        # Process request
+        response = await process_answer_request(
+            rag_chain,
+            request_data,
+            request_id,
+            prompt_settings,
+            db_sessionmaker,
+            client_ip,
+            user_agent
+        )
+        
+        # Update metrics
+        if PROMETHEUS_AVAILABLE and query_requests_total is not None:
+            query_requests_total.labels(status="success").inc()
+            query_latency_seconds.observe(response.metrics.latency_ms / 1000.0)
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"[{request_id}] Error processing answer request: {e}", exc_info=True)
+        if PROMETHEUS_AVAILABLE and query_requests_total is not None:
+            query_requests_total.labels(status="error").inc()
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Error processing request",
+                "detail": "Internal server error",
+                "request_id": request_id,
+                "code": "INTERNAL_ERROR"
+            }
+        )
+
+
+def chunk_text_for_streaming(text: str, chunk_size: int = 80) -> List[str]:
+    """
+    Split text into chunks for pseudo-streaming.
+    
+    Args:
+        text: Text to chunk
+        chunk_size: Target chunk size in characters
+        
+    Returns:
+        List of text chunks
+    """
+    chunks = []
+    for i in range(0, len(text), chunk_size):
+        chunks.append(text[i:i + chunk_size])
+    return chunks
+
+
+@app.post("/stream")
+async def stream_answer(request_data: AnswerRequest, request: Request):
+    """
+    Server-Sent Events (SSE) streaming endpoint.
+    
+    Returns answer in streaming format with events: id, answer (deltas), source, end.
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+    
+    # Validate API key
+    if not validate_api_key(request_data.api_key):
+        async def error_stream():
+            error_event = SSEEvent(
+                type="error",
+                error=ErrorPayload(
+                    code="INVALID_API_KEY",
+                    message="Invalid API key",
+                    request_id=request_id
+                )
+            )
+            yield f"data: {error_event.json()}\n\n"
+        
+        return StreamingResponse(error_stream(), media_type="text/event-stream")
+    
+    # Rate limiting
+    client_ip = request.client.host if request.client else "unknown"
+    allowed, error_msg = query_limiter.is_allowed(client_ip)
+    if not allowed:
+        if PROMETHEUS_AVAILABLE and rate_limit_hits_total is not None:
+            rate_limit_hits_total.labels(endpoint="stream").inc()
+        
+        async def rate_limit_stream():
+            error_event = SSEEvent(
+                type="error",
+                error=ErrorPayload(
+                    code="RATE_LIMIT_EXCEEDED",
+                    message=error_msg,
+                    request_id=request_id
+                )
+            )
+            yield f"data: {error_event.json()}\n\n"
+        
+        return StreamingResponse(rate_limit_stream(), media_type="text/event-stream")
+    
+    # Get RAG chain
+    rag_chain = getattr(request.app.state, "rag_chain", None)
+    if rag_chain is None:
+        async def unavailable_stream():
+            error_event = SSEEvent(
+                type="error",
+                error=ErrorPayload(
+                    code="SERVICE_UNAVAILABLE",
+                    message="RAG chain not initialized",
+                    request_id=request_id
+                )
+            )
+            yield f"data: {error_event.json()}\n\n"
+        
+        return StreamingResponse(unavailable_stream(), media_type="text/event-stream")
+    
+    async def generate_stream():
+        try:
+            # Get prompt settings
+            prompt_settings = getattr(request.app.state, "prompt_settings", None)
+            if prompt_settings is None:
+                prompt_settings = load_prompt_settings_from_env()
+            
+            # Get database sessionmaker
+            db_sessionmaker = getattr(request.app.state, "db_sessionmaker", None)
+            
+            # Process request (get full answer first)
+            response = await process_answer_request(
+                rag_chain,
+                request_data,
+                request_id,
+                prompt_settings,
+                db_sessionmaker,
+                client_ip,
+                request.headers.get("User-Agent")
+            )
+            
+            # Send ID event
+            id_event = SSEEvent(
+                type="id",
+                conversation_id=response.conversation_id,
+                request_id=response.request_id
+            )
+            yield f"data: {id_event.json()}\n\n"
+            
+            # Pseudo-stream answer (chunk into ~80 char pieces)
+            answer_chunks = chunk_text_for_streaming(response.answer, chunk_size=80)
+            for chunk in answer_chunks:
+                answer_event = SSEEvent(
+                    type="answer",
+                    delta=chunk
+                )
+                yield f"data: {answer_event.json()}\n\n"
+            
+            # Send sources
+            for source in response.sources:
+                source_event = SSEEvent(
+                    type="source",
+                    source=source
+                )
+                yield f"data: {source_event.json()}\n\n"
+            
+            # Send end event with metrics
+            end_event = SSEEvent(
+                type="end",
+                metrics=response.metrics
+            )
+            yield f"data: {end_event.json()}\n\n"
+            
+        except Exception as e:
+            logger.error(f"[{request_id}] Error in stream: {e}", exc_info=True)
+            error_event = SSEEvent(
+                type="error",
+                error=ErrorPayload(
+                    code="INTERNAL_ERROR",
+                    message=str(e),
+                    request_id=request_id
+                )
+            )
+            yield f"data: {error_event.json()}\n\n"
+    
+    return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
 
 if __name__ == "__main__":

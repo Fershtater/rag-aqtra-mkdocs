@@ -580,10 +580,13 @@ def build_rag_chain(
     system_prompt_template = build_system_prompt(prompt_settings, response_language="{response_language}")
     
     # Human prompt with explicit structure: context first, then question and instructions.
+    # Include chat_history if provided (empty string if not)
+    # If chat_history is empty, the "Conversation history:" line will still appear but with empty content
     human_template = (
         "Documentation context (relevant fragments):\n\n"
         "{context}\n\n"
         "---\n\n"
+        "Conversation history:\n{chat_history}\n\n"
         "User question: {input}\n\n"
         "Instructions:\n"
         "- Use ONLY the information from the context\n"
