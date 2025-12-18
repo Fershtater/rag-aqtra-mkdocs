@@ -4,9 +4,11 @@ Common answering logic for v2 API endpoints.
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
-from time import time
+import time
+from time import time as time_func
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.api.v2_models import (
@@ -308,7 +310,8 @@ async def generate_answer(
     response_language: Optional[str] = None,
     top_k_override: Optional[int] = None,
     context_hint: Optional[Dict] = None,
-    system_prompt: Optional[str] = None
+    system_prompt: Optional[str] = None,
+    vectorstore=None  # Optional: for short-circuit when retriever not extractable
 ) -> Tuple[str, List[Source], bool, Dict]:
     """
     Generate answer using RAG chain.
@@ -341,6 +344,249 @@ async def generate_answer(
     # Build system prompt (use default if not provided)
     if not system_prompt:
         system_prompt = build_system_prompt(prompt_settings, response_language=response_language)
+    
+    # Short-circuit for strict mode + no sources
+    # Try to retrieve documents first to check if we have any sources
+    # This avoids unnecessary LLM call when strict mode and no documentation available
+    if prompt_settings.mode == "strict":
+        try:
+            # Extract retriever from rag_chain
+            # LangChain create_retrieval_chain stores retriever in chain
+            retriever = None
+            chain_attrs = []
+            
+            # Try multiple ways to get retriever
+            if hasattr(rag_chain, 'retriever'):
+                retriever = rag_chain.retriever
+                chain_attrs.append("has retriever attr")
+            elif hasattr(rag_chain, 'steps') and len(rag_chain.steps) > 0:
+                # Try to get retriever from chain steps
+                for step in rag_chain.steps:
+                    if hasattr(step, 'retriever'):
+                        retriever = step.retriever
+                        chain_attrs.append(f"found in step: {type(step).__name__}")
+                        break
+            elif hasattr(rag_chain, 'first') and hasattr(rag_chain.first, 'retriever'):
+                retriever = rag_chain.first.retriever
+                chain_attrs.append("found in first")
+            elif hasattr(rag_chain, 'bound') and hasattr(rag_chain.bound, 'retriever'):
+                retriever = rag_chain.bound.retriever
+                chain_attrs.append("found in bound")
+            
+            # #region agent log
+            try:
+                with open("/Users/ila/RagAqtraDocs/.cursor/debug.log", "a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "sessionId": "debug-session",
+                        "runId": "short-circuit-check",
+                        "location": "answering.py:generate_answer",
+                        "message": "Attempting to extract retriever",
+                        "data": {
+                            "request_id": request_id,
+                            "chain_type": type(rag_chain).__name__,
+                            "chain_attrs": chain_attrs,
+                            "retriever_found": retriever is not None,
+                            "strict_mode": True
+                        },
+                        "timestamp": int(time.time() * 1000)
+                    }) + "\n")
+            except Exception:
+                pass
+            # #endregion
+            
+            if retriever:
+                # Retrieve documents to check if we have any sources
+                retrieved_docs = await asyncio.to_thread(retriever.invoke, question)
+                # #region agent log
+                try:
+                    with open("/Users/ila/RagAqtraDocs/.cursor/debug.log", "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "sessionId": "debug-session",
+                            "runId": "short-circuit-check",
+                            "location": "answering.py:generate_answer",
+                            "message": "Retrieved docs for short-circuit check",
+                            "data": {
+                                "retrieved_count": len(retrieved_docs) if retrieved_docs else 0,
+                                "strict_mode": True,
+                                "request_id": request_id
+                            },
+                            "timestamp": int(time.time() * 1000)
+                        }) + "\n")
+                except Exception:
+                    pass
+                # #endregion
+                # Check if we have any relevant sources (check scores if available)
+                has_relevant_sources = False
+                if retrieved_docs and len(retrieved_docs) > 0:
+                    # Check scores if available in metadata
+                    not_found_score_threshold = float(os.getenv("NOT_FOUND_SCORE_THRESHOLD", "0.20"))
+                    scores = []
+                    for doc in retrieved_docs:
+                        if hasattr(doc, "metadata") and doc.metadata:
+                            score = doc.metadata.get("score")
+                            if score is not None:
+                                try:
+                                    scores.append(float(score))
+                                except (ValueError, TypeError):
+                                    pass
+                    # If we have scores, check if any are above threshold
+                    if scores:
+                        max_score = max(scores)
+                        has_relevant_sources = max_score >= not_found_score_threshold
+                    else:
+                        # No scores available - assume documents might be relevant
+                        # Only short-circuit if truly no documents
+                        has_relevant_sources = True
+                
+                if not has_relevant_sources:
+                    # Strict mode + no relevant sources: return early without calling LLM
+                    logger.info(f"[{request_id}] Strict mode + no relevant sources: short-circuiting LLM call")
+                    # #region agent log
+                    try:
+                        with open("/Users/ila/RagAqtraDocs/.cursor/debug.log", "a", encoding="utf-8") as f:
+                            f.write(json.dumps({
+                                "sessionId": "debug-session",
+                                "runId": "short-circuit-check",
+                                "location": "answering.py:generate_answer",
+                                "message": "Short-circuit triggered: strict mode + no relevant sources",
+                                "data": {
+                                    "request_id": request_id,
+                                    "question": question[:100],
+                                    "retrieved_count": len(retrieved_docs) if retrieved_docs else 0,
+                                    "max_score": max(scores) if scores else None,
+                                    "threshold": not_found_score_threshold
+                                },
+                                "timestamp": int(time.time() * 1000)
+                            }) + "\n")
+                    except Exception:
+                        pass
+                    # #endregion
+                    not_found_message = "I don't have enough information in the documentation to answer this question."
+                    return not_found_message, [], True, {"context_docs": []}
+            else:
+                # Alternative: try to use vectorstore directly if available
+                if vectorstore:
+                    try:
+                        # Use similarity_search_with_score to get scores
+                        effective_k = top_k_override if top_k_override else prompt_settings.default_top_k
+                        effective_k = max(1, min(10, effective_k))
+                        
+                        # Search with scores (FAISS similarity_search_with_score takes query string)
+                        docs_with_scores = await asyncio.to_thread(
+                            vectorstore.similarity_search_with_score,
+                            question,
+                            k=effective_k
+                        )
+                        
+                        # Extract docs and scores
+                        retrieved_docs = [doc for doc, score in docs_with_scores]
+                        scores = [score for doc, score in docs_with_scores]
+                        # Check scores (FAISS returns distance, lower is better, convert to similarity)
+                        not_found_score_threshold = float(os.getenv("NOT_FOUND_SCORE_THRESHOLD", "0.20"))
+                        has_relevant_sources = False
+                        
+                        if retrieved_docs and len(retrieved_docs) > 0 and scores:
+                            # FAISS returns distance (lower = more similar)
+                            # Convert to similarity score (1 - normalized distance)
+                            # For cosine similarity, distance is already normalized
+                            # Check if any document has similarity above threshold
+                            # Note: FAISS distance might need conversion depending on metric
+                            # For now, check if min distance is low enough (indicating high similarity)
+                            min_distance = min(scores)
+                            # Rough conversion: if distance < 0.5, consider it relevant
+                            # This is approximate and may need tuning
+                            max_similarity = 1.0 - min_distance if min_distance <= 1.0 else 0.0
+                            has_relevant_sources = max_similarity >= not_found_score_threshold
+                        elif retrieved_docs and len(retrieved_docs) > 0:
+                            # No scores available - assume documents might be relevant
+                            has_relevant_sources = True
+                        
+                        # #region agent log
+                        try:
+                            with open("/Users/ila/RagAqtraDocs/.cursor/debug.log", "a", encoding="utf-8") as f:
+                                f.write(json.dumps({
+                                    "sessionId": "debug-session",
+                                    "runId": "short-circuit-check",
+                                    "location": "answering.py:generate_answer",
+                                    "message": "Using vectorstore similarity_search_with_score for short-circuit",
+                                    "data": {
+                                        "retrieved_count": len(retrieved_docs) if retrieved_docs else 0,
+                                        "scores": scores[:3] if scores else None,  # Log first 3 scores
+                                        "min_distance": min(scores) if scores else None,
+                                        "max_similarity": max_similarity if scores else None,
+                                        "has_relevant_sources": has_relevant_sources,
+                                        "threshold": not_found_score_threshold,
+                                        "strict_mode": True,
+                                        "request_id": request_id
+                                    },
+                                    "timestamp": int(time.time() * 1000)
+                                }) + "\n")
+                        except Exception:
+                            pass
+                        # #endregion
+                        
+                        if not has_relevant_sources:
+                            logger.info(f"[{request_id}] Strict mode + no relevant sources: short-circuiting LLM call (via vectorstore)")
+                            # #region agent log
+                            try:
+                                with open("/Users/ila/RagAqtraDocs/.cursor/debug.log", "a", encoding="utf-8") as f:
+                                    f.write(json.dumps({
+                                        "sessionId": "debug-session",
+                                        "runId": "short-circuit-check",
+                                        "location": "answering.py:generate_answer",
+                                        "message": "Short-circuit triggered via vectorstore: strict mode + no relevant sources",
+                                        "data": {
+                                            "request_id": request_id,
+                                            "question": question[:100],
+                                            "retrieved_count": len(retrieved_docs) if retrieved_docs else 0,
+                                            "max_score": max(scores) if scores else None,
+                                            "threshold": not_found_score_threshold
+                                        },
+                                        "timestamp": int(time.time() * 1000)
+                                    }) + "\n")
+                            except Exception:
+                                pass
+                            # #endregion
+                            not_found_message = "I don't have enough information in the documentation to answer this question."
+                            return not_found_message, [], True, {"context_docs": []}
+                    except Exception as e:
+                        logger.debug(f"[{request_id}] Could not use vectorstore for short-circuit: {e}")
+                else:
+                    # #region agent log
+                    try:
+                        with open("/Users/ila/RagAqtraDocs/.cursor/debug.log", "a", encoding="utf-8") as f:
+                            f.write(json.dumps({
+                                "sessionId": "debug-session",
+                                "runId": "short-circuit-check",
+                                "location": "answering.py:generate_answer",
+                                "message": "Retriever not found in chain and vectorstore not available, skipping short-circuit",
+                                "data": {
+                                    "request_id": request_id,
+                                    "chain_type": type(rag_chain).__name__,
+                                    "chain_attrs_checked": chain_attrs
+                                },
+                                "timestamp": int(time.time() * 1000)
+                            }) + "\n")
+                    except Exception:
+                        pass
+                    # #endregion
+        except Exception as e:
+            # If retrieval check fails, continue with normal flow
+            logger.debug(f"[{request_id}] Could not check retrieval for short-circuit: {e}")
+            # #region agent log
+            try:
+                with open("/Users/ila/RagAqtraDocs/.cursor/debug.log", "a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "sessionId": "debug-session",
+                        "runId": "short-circuit-check",
+                        "location": "answering.py:generate_answer",
+                        "message": "Exception during short-circuit check",
+                        "data": {"request_id": request_id, "error": str(e)},
+                        "timestamp": int(time.time() * 1000)
+                    }) + "\n")
+            except Exception:
+                pass
+            # #endregion
     
     # Build chain input
     chain_input = {
@@ -395,7 +641,9 @@ async def process_answer_request(
     prompt_settings: PromptSettings,
     db_sessionmaker,
     client_ip: str,
-    user_agent: Optional[str] = None
+    user_agent: Optional[str] = None,
+    accept_language_header: Optional[str] = None,
+    vectorstore=None  # Optional: for short-circuit when retriever not extractable
 ) -> AnswerResponse:
     """
     Process answer request (common logic for /api/answer and /stream).
@@ -412,7 +660,7 @@ async def process_answer_request(
     Returns:
         AnswerResponse
     """
-    start_time = time()
+    start_time = time_func()
     
     # Get or create conversation ID
     conversation_id = await get_or_create_conversation(
@@ -433,14 +681,45 @@ async def process_answer_request(
     
     # Build cache key (include history signature)
     history_signature = hashlib.md5(chat_history_text.encode()).hexdigest()[:8] if chat_history_text else "no_history"
-    detector_version = "v1"
-    reranking_enabled = os.getenv("RERANKING_ENABLED", "0").lower() in ("1", "true", "yes")
+    
+    # Build passthrough namespace early (needed for language selection and cache key)
+    context_hint_dict = None
+    if request.context_hint:
+        context_hint_dict = request.context_hint.dict()
+    
+    passthrough_dict = {}
+    if request.passthrough:
+        passthrough_dict.update(request.passthrough)
+    if context_hint_dict:
+        passthrough_dict.update(context_hint_dict)
+    
+    # Select output language early (needed for cache key)
+    system_namespace_preview = build_system_namespace(
+        request_id,
+        conversation_id,
+        prompt_settings.mode,
+        passthrough=passthrough_dict,
+        context_hint=context_hint_dict,
+        accept_language_header=accept_language_header
+    )
+    output_language = system_namespace_preview["output_language"]
+    
+    # Get template info for cache key
+    from app.core.prompt_config import get_selected_template_info
+    template_info = get_selected_template_info()
+    template_identifier = template_info.get("selected_template", "legacy")
+    
+    # Build cache key with template and language
     top_k_value = prompt_settings.default_top_k
     if request.retrieval and request.retrieval.top_k:
         top_k_value = request.retrieval.top_k
     
+    detector_version = "v1"
+    reranking_enabled = os.getenv("RERANKING_ENABLED", "0").lower() in ("1", "true", "yes")
     settings_signature = (
         f"mode={prompt_settings.mode}_"
+        f"template={template_identifier}_"
+        f"lang={output_language}_"
         f"top_k={top_k_value}_"
         f"temp={prompt_settings.default_temperature}_"
         f"max_tokens={getattr(prompt_settings, 'default_max_tokens', None)}_"
@@ -460,7 +739,7 @@ async def process_answer_request(
     
     if cached_result:
         logger.debug(f"[{request_id}] Cache hit for query")
-        latency_ms = int((time() - start_time) * 1000)
+        latency_ms = int((time_func() - start_time) * 1000)
         
         # Update conversation_id in cached response
         cached_result.conversation_id = conversation_id
@@ -480,10 +759,6 @@ async def process_answer_request(
     if request.retrieval and request.retrieval.top_k:
         top_k_override = request.retrieval.top_k
     
-    context_hint_dict = None
-    if request.context_hint:
-        context_hint_dict = request.context_hint.dict()
-    
     # For Jinja2 mode, we need context_docs to build source namespace
     # Call generate_answer once to get context_docs, then render prompt and call again
     # For legacy mode, just build default prompt
@@ -497,26 +772,13 @@ async def process_answer_request(
             chat_history=chat_history_text,
             top_k_override=top_k_override,
             context_hint=context_hint_dict,
-            system_prompt=""  # Temporary, will be replaced
+            system_prompt="",  # Temporary, will be replaced
+            vectorstore=vectorstore
         )
         
-        # Build passthrough namespace (needed for language selection)
-        passthrough_dict = {}
-        if request.passthrough:
-            passthrough_dict.update(request.passthrough)
-        if context_hint_dict:
-            passthrough_dict.update(context_hint_dict)
-        
-        # Build namespaces from context_docs
+        # Build namespaces from context_docs (system_namespace already built above for cache key)
         context_docs = context_info.get("context_docs", [])
-        system_namespace = build_system_namespace(
-            request_id,
-            conversation_id,
-            prompt_settings.mode,
-            passthrough=passthrough_dict,
-            context_hint=context_hint_dict,
-            accept_language_header=None  # TODO: pass from request if available
-        )
+        system_namespace = system_namespace_preview  # Reuse already built namespace
         source_namespace = build_source_namespace(context_docs, prompt_settings)
         
         tools_namespace = {}  # Empty for now
@@ -540,26 +802,13 @@ async def process_answer_request(
             chat_history=chat_history_text,
             top_k_override=top_k_override,
             context_hint=context_hint_dict,
-            system_prompt=rendered_system_prompt
+            system_prompt=rendered_system_prompt,
+            vectorstore=vectorstore
         )
     else:
         # Legacy mode: use default system prompt
-        # Still select language for system namespace (for consistency)
-        passthrough_dict = {}
-        if request.passthrough:
-            passthrough_dict.update(request.passthrough)
-        if context_hint_dict:
-            passthrough_dict.update(context_hint_dict)
-        
-        system_namespace = build_system_namespace(
-            request_id,
-            conversation_id,
-            prompt_settings.mode,
-            passthrough=passthrough_dict,
-            context_hint=context_hint_dict,
-            accept_language_header=None
-        )
-        response_language = system_namespace["output_language"]  # Use selected language
+        # system_namespace already built above for cache key
+        response_language = system_namespace_preview["output_language"]  # Use selected language
         default_system_prompt = build_system_prompt(prompt_settings, response_language=response_language)
         
         answer, sources, not_found, _ = await generate_answer(
@@ -570,10 +819,11 @@ async def process_answer_request(
             chat_history=chat_history_text,
             top_k_override=top_k_override,
             context_hint=context_hint_dict,
-            system_prompt=default_system_prompt
+            system_prompt=default_system_prompt,
+            vectorstore=vectorstore
         )
     
-    latency_sec = time() - start_time
+    latency_sec = time_func() - start_time
     latency_ms = int(latency_sec * 1000)
     
     # Build response

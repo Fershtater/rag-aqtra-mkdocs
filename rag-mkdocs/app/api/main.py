@@ -229,6 +229,28 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing RAG chain...")
     
     try:
+        # Validate prompt template on startup if enabled
+        validate_on_startup = os.getenv("PROMPT_VALIDATE_ON_STARTUP", "1").lower() in ("1", "true", "yes")
+        if validate_on_startup:
+            try:
+                from app.core.prompt_config import get_prompt_template_content, is_jinja_mode
+                from app.core.prompt_renderer import PromptRenderer
+                
+                if is_jinja_mode():
+                    template_str = get_prompt_template_content()
+                    max_chars = int(os.getenv("PROMPT_MAX_CHARS", "40000"))
+                    strict_undefined = os.getenv("PROMPT_STRICT_UNDEFINED", "1").lower() in ("1", "true", "yes")
+                    renderer = PromptRenderer(max_chars=max_chars, strict_undefined=strict_undefined)
+                    renderer.validate_template(template_str)
+                    logger.info("✓ Prompt template validated successfully")
+                else:
+                    logger.info("Prompt template validation skipped (legacy mode)")
+            except Exception as e:
+                logger.error(f"Prompt template validation failed: {e}", exc_info=True)
+                fail_hard = os.getenv("PROMPT_FAIL_HARD", "0").lower() in ("1", "true", "yes")
+                if fail_hard:
+                    raise
+        
         # Load vectorstore and create RAG chain with settings
         rag_chain, vectorstore, prompt_settings = build_rag_chain_and_settings()
         
@@ -1190,6 +1212,28 @@ async def answer_question(request_data: AnswerRequest, request: Request):
         # Get user agent
         user_agent = request.headers.get("User-Agent")
         
+        # Get Accept-Language header
+        accept_language_header = request.headers.get("Accept-Language")
+        # #region agent log
+        import json
+        import time
+        try:
+            with open("/Users/ila/RagAqtraDocs/.cursor/debug.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "sessionId": "debug-session",
+                    "runId": "accept-language-check",
+                    "location": "main.py:/api/answer",
+                    "message": "Accept-Language header extracted",
+                    "data": {"accept_language": accept_language_header, "request_id": request_id},
+                    "timestamp": int(time.time() * 1000)
+                }) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        
+        # Get vectorstore for short-circuit
+        vectorstore = getattr(request.app.state, "vectorstore", None)
+        
         # Process request
         response = await process_answer_request(
             rag_chain,
@@ -1198,7 +1242,9 @@ async def answer_question(request_data: AnswerRequest, request: Request):
             prompt_settings,
             db_sessionmaker,
             client_ip,
-            user_agent
+            user_agent,
+            accept_language_header,
+            vectorstore
         )
         
         # Update metrics
@@ -1310,6 +1356,12 @@ async def stream_answer(request_data: AnswerRequest, request: Request):
             # Get database sessionmaker
             db_sessionmaker = getattr(request.app.state, "db_sessionmaker", None)
             
+            # Get Accept-Language header
+            accept_language_header = request.headers.get("Accept-Language")
+            
+            # Get vectorstore for short-circuit
+            vectorstore = getattr(request.app.state, "vectorstore", None)
+            
             # Process request (get full answer first)
             response = await process_answer_request(
                 rag_chain,
@@ -1318,7 +1370,9 @@ async def stream_answer(request_data: AnswerRequest, request: Request):
                 prompt_settings,
                 db_sessionmaker,
                 client_ip,
-                request.headers.get("User-Agent")
+                request.headers.get("User-Agent"),
+                accept_language_header,
+                vectorstore
             )
             
             # Send ID event

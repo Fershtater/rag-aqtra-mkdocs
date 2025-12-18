@@ -206,9 +206,11 @@ class PromptRenderer:
             # Compile template
             self.env.parse(template_str)
         except TemplateSyntaxError as e:
-            raise TemplateSyntaxError(f"Template syntax error: {e}") from e
+            # Re-raise as-is (it already has all needed info)
+            raise
         except UndefinedError as e:
-            raise UndefinedError(f"Undefined variable: {e}") from e
+            # Re-raise as-is
+            raise
     
     def render(
         self,

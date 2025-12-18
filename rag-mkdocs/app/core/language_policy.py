@@ -76,11 +76,22 @@ def parse_accept_language(accept_language_header: Optional[str]) -> list[str]:
         if not lang_part:
             continue
         
-        # Normalize
+        # Extract base language before normalization
+        lang_lower = lang_part.lower().strip()
+        if "-" in lang_lower:
+            base_lang = lang_lower.split("-")[0]
+        else:
+            base_lang = lang_lower
+        
+        # Only process if base language is in allowed list
+        if base_lang not in ALLOWED_LANGUAGES:
+            continue
+        
+        # Normalize (should be same as base_lang if it's allowed)
         normalized = normalize_language(lang_part)
         
-        # Only add if it's not already in list and is allowed
-        if normalized in ALLOWED_LANGUAGES and normalized not in languages:
+        # Only add if it's not already in list
+        if normalized not in languages:
             languages.append(normalized)
     
     return languages
@@ -114,14 +125,29 @@ def select_output_language(
     if passthrough:
         lang = passthrough.get("language") or passthrough.get("lang")
         if lang:
-            normalized = normalize_language(lang)
-            if normalized in ALLOWED_LANGUAGES:
+            # Check if original language is in allowed list (before normalization)
+            lang_lower = str(lang).lower().strip()
+            if "-" in lang_lower:
+                base_lang = lang_lower.split("-")[0]
+            else:
+                base_lang = lang_lower
+            
+            if base_lang in ALLOWED_LANGUAGES:
+                normalized = normalize_language(lang)
                 return normalized, "passthrough.language"
     
     # Priority 2: context_hint.language
     if context_hint and context_hint.get("language"):
-        normalized = normalize_language(context_hint["language"])
-        if normalized in ALLOWED_LANGUAGES:
+        lang = context_hint["language"]
+        # Check if original language is in allowed list
+        lang_lower = str(lang).lower().strip()
+        if "-" in lang_lower:
+            base_lang = lang_lower.split("-")[0]
+        else:
+            base_lang = lang_lower
+        
+        if base_lang in ALLOWED_LANGUAGES:
+            normalized = normalize_language(lang)
             return normalized, "context_hint.language"
     
     # Priority 3: Accept-Language header
