@@ -1,5 +1,8 @@
 """
 Common answering logic for v2 API endpoints.
+
+This module provides backward-compatible functions that use services internally.
+For new code, prefer using services directly.
 """
 
 import asyncio
@@ -11,7 +14,7 @@ import time
 from time import time as time_func
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.api.v2_models import (
+from app.api.schemas.v2 import (
     AnswerRequest,
     AnswerResponse,
     MetricsPayload,
@@ -23,18 +26,21 @@ from app.core.markdown_utils import build_doc_url
 from app.core.prompt_config import (
     PromptSettings,
     detect_response_language,
-    load_prompt_settings_from_env,
     get_prompt_template_content,
     is_jinja_mode,
     build_system_prompt,
 )
-from app.core.prompt_renderer import PromptRenderer
-from app.core.language_policy import select_output_language
 from app.infra.cache import response_cache
 from app.infra.conversations import append_message, get_or_create_conversation, load_history
-from datetime import datetime
+from app.services.answer_service import AnswerService
+from app.services.conversation_service import ConversationService
+from app.services.prompt_service import PromptService
 
 logger = logging.getLogger(__name__)
+
+# Create default service instances (will be initialized per-request with proper dependencies)
+# These are module-level for backward compatibility
+_default_prompt_service = PromptService()
 
 
 def normalize_sources(
@@ -211,6 +217,8 @@ def build_system_namespace(
     """
     Build system namespace for Jinja2 template.
     
+    Backward-compatible wrapper around PromptService.
+    
     Args:
         request_id: Request ID
         conversation_id: Conversation ID (optional)
@@ -222,35 +230,28 @@ def build_system_namespace(
     Returns:
         Dictionary with system namespace (includes output_language and language_reason)
     """
-    # Select output language
-    output_language, language_reason = select_output_language(
-        passthrough=passthrough,
-        context_hint=context_hint,
-        accept_language_header=accept_language_header
+    return _default_prompt_service.build_system_namespace(
+        request_id,
+        conversation_id,
+        mode,
+        passthrough,
+        context_hint,
+        accept_language_header
     )
-    
-    return {
-        "request_id": request_id,
-        "conversation_id": conversation_id or "",
-        "now_iso": datetime.utcnow().isoformat(),
-        "timezone": "UTC",
-        "app_version": os.getenv("APP_VERSION", ""),
-        "mode": mode,
-        "output_language": output_language,
-        "language_reason": language_reason
-    }
 
 
 def render_system_prompt(
     template_str: str,
-    system: Dict[str, any],
-    source: Dict[str, any],
-    passthrough: Dict[str, any],
-    tools: Dict[str, any],
+    system: Dict[str, Any],
+    source: Dict[str, Any],
+    passthrough: Dict[str, Any],
+    tools: Dict[str, Any],
     request_id: str
 ) -> str:
     """
     Render system prompt using Jinja2 or return legacy string.
+    
+    Backward-compatible wrapper around PromptService.
     
     Args:
         template_str: Template string (Jinja2 or legacy)
@@ -263,42 +264,14 @@ def render_system_prompt(
     Returns:
         Rendered prompt string
     """
-    if not is_jinja_mode():
-        # Legacy mode: template_str is already the final prompt
-        return template_str
-    
-    # Jinja2 mode: render template
-    try:
-        max_chars = int(os.getenv("PROMPT_MAX_CHARS", "40000"))
-        strict_undefined = os.getenv("PROMPT_STRICT_UNDEFINED", "1").lower() in ("1", "true", "yes")
-        
-        renderer = PromptRenderer(max_chars=max_chars, strict_undefined=strict_undefined)
-        rendered = renderer.render(
-            template_str,
-            system=system,
-            source=source,
-            passthrough=passthrough,
-            tools=tools
-        )
-        
-        # Log rendered prompt if enabled
-        log_rendered = os.getenv("PROMPT_LOG_RENDERED", "0").lower() in ("1", "true", "yes")
-        if log_rendered:
-            log_length = min(len(rendered), 8000)
-            logger.info(f"[{request_id}] Rendered prompt (first {log_length} chars):\n{rendered[:log_length]}")
-        
-        return rendered
-        
-    except Exception as e:
-        logger.error(f"[{request_id}] Error rendering Jinja2 template: {e}, falling back to legacy", exc_info=True)
-        # Fallback to legacy
-        fail_hard = os.getenv("PROMPT_FAIL_HARD", "0").lower() in ("1", "true", "yes")
-        if fail_hard:
-            raise
-        
-        # Return legacy prompt
-        prompt_settings = load_prompt_settings_from_env()
-        return build_system_prompt(prompt_settings, response_language=system.get("mode", "strict"))
+    return _default_prompt_service.render_system_prompt(
+        template_str,
+        system,
+        source,
+        passthrough,
+        tools,
+        request_id
+    )
 
 
 async def generate_answer(

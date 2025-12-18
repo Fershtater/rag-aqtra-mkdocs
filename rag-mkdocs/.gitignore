@@ -25,8 +25,20 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Vectorstore files
-vectorstore/faiss_index/
+# Runtime artifacts
+var/
+app/vectorstore/
+**/faiss_index/
+**/*.faiss
+**/*.pkl
+vectorstore/
+
+# Virtual Environment
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
 
 # Logs
 *.log
