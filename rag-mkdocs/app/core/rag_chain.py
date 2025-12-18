@@ -575,9 +575,14 @@ def build_rag_chain(
             logger.info("Reranking requested but not available in current LangChain version; using base retriever")
         retriever = vectorstore.as_retriever(search_kwargs={"k": effective_k})
     
-    # Build system prompt template with {response_language} placeholder
-    # Language will be determined per request and injected at runtime
-    system_prompt_template = build_system_prompt(prompt_settings, response_language="{response_language}")
+    # Build system prompt template as a variable placeholder
+    # The actual system_prompt will be provided at runtime (allows Jinja2 rendering)
+    # For backward compatibility, we still build a default legacy prompt
+    default_system_prompt = build_system_prompt(prompt_settings, response_language="{response_language}")
+    
+    # System message uses {system_prompt} variable that will be provided at invoke time
+    # If not provided, falls back to default_system_prompt (for legacy compatibility)
+    system_template = "{system_prompt}"
     
     # Human prompt with explicit structure: context first, then question and instructions.
     # Include chat_history if provided (empty string if not)
@@ -595,9 +600,9 @@ def build_rag_chain(
         "- If the context is insufficient, explain what exactly is missing"
     )
 
-    logger.info("Creating prompt template...")
+    logger.info("Creating prompt template with dynamic system_prompt...")
     prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt_template),
+        ("system", system_template),
         ("human", human_template),
     ])
     

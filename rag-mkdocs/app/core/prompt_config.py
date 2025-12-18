@@ -2,12 +2,14 @@
 Prompt configuration for RAG assistant.
 
 Contains system prompt settings and assistant behavior rules.
+Supports both legacy and Jinja2 template modes.
 """
 
 import os
 import re
 from dataclasses import dataclass
-from typing import Literal
+from pathlib import Path
+from typing import Literal, Optional
 
 
 @dataclass
@@ -275,4 +277,165 @@ def build_system_prompt(settings: PromptSettings, response_language: str = "{res
     ]
     
     return "\n".join(prompt_parts)
+
+
+def is_jinja_mode() -> bool:
+    """
+    Check if Jinja2 template mode is enabled.
+    
+    Returns:
+        True if PROMPT_TEMPLATE_MODE == "jinja", False otherwise (legacy mode)
+    """
+    mode = os.getenv("PROMPT_TEMPLATE_MODE", "legacy").lower()
+    return mode == "jinja"
+
+
+def get_prompt_template_content(settings: Optional[PromptSettings] = None) -> str:
+    """
+    Get prompt template content based on configuration.
+    
+    Priority:
+    1. PROMPT_TEMPLATE (if set, Jinja2 string)
+    2. PROMPT_TEMPLATE_PATH (if set, read file)
+    3. PROMPT_PRESET (if jinja mode, select from app/prompts/)
+    4. Legacy build_system_prompt() (default)
+    
+    Args:
+        settings: PromptSettings instance (if None, loaded from env)
+        
+    Returns:
+        Template string (Jinja2 or legacy)
+    """
+    if not is_jinja_mode():
+        # Legacy mode: use build_system_prompt
+        if settings is None:
+            settings = load_prompt_settings_from_env()
+        return build_system_prompt(settings, response_language="{response_language}")
+    
+    # Jinja mode: try PROMPT_TEMPLATE first
+    template_str = os.getenv("PROMPT_TEMPLATE")
+    if template_str:
+        return template_str
+    
+    # Try PROMPT_TEMPLATE_PATH
+    template_path = os.getenv("PROMPT_TEMPLATE_PATH")
+    if template_path:
+        try:
+            # Resolve path relative to project root if relative
+            if not os.path.isabs(template_path):
+                project_root = Path(__file__).parent.parent.parent
+                template_path = project_root / template_path
+            else:
+                template_path = Path(template_path)
+            
+            if template_path.exists():
+                return template_path.read_text(encoding="utf-8")
+            else:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"PROMPT_TEMPLATE_PATH not found: {template_path}, trying preset")
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Error reading PROMPT_TEMPLATE_PATH: {e}, trying preset")
+    
+    # Try PROMPT_PRESET
+    preset = os.getenv("PROMPT_PRESET", "strict").lower()
+    prompt_dir = os.getenv("PROMPT_DIR", "app/prompts")
+    
+    # Map preset to filename
+    preset_map = {
+        "strict": "aqtra_strict_en.j2",
+        "support": "aqtra_support_en.j2",
+        "developer": "aqtra_developer_en.j2"
+    }
+    
+    if preset in preset_map:
+        filename = preset_map[preset]
+        try:
+            # Resolve path relative to project root
+            project_root = Path(__file__).parent.parent.parent
+            preset_path = project_root / prompt_dir / filename
+            
+            if preset_path.exists():
+                return preset_path.read_text(encoding="utf-8")
+            else:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Preset template not found: {preset_path}, falling back to legacy")
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Error reading preset template: {e}, falling back to legacy")
+    else:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Unknown PROMPT_PRESET: {preset}, falling back to legacy")
+    
+    # Fallback to legacy
+    if settings is None:
+        settings = load_prompt_settings_from_env()
+    return build_system_prompt(settings, response_language="{response_language}")
+
+
+def get_selected_template_info() -> dict:
+    """
+    Get information about selected template.
+    
+    Returns:
+        Dictionary with template selection info:
+        - selected_template: "inline"|"path"|"preset:<name>"|"legacy"
+        - selected_template_path: path if applicable
+        - preset: preset name if applicable
+    """
+    if not is_jinja_mode():
+        return {
+            "selected_template": "legacy",
+            "selected_template_path": None,
+            "preset": None
+        }
+    
+    # Check PROMPT_TEMPLATE
+    if os.getenv("PROMPT_TEMPLATE"):
+        return {
+            "selected_template": "inline",
+            "selected_template_path": None,
+            "preset": None
+        }
+    
+    # Check PROMPT_TEMPLATE_PATH
+    template_path = os.getenv("PROMPT_TEMPLATE_PATH")
+    if template_path:
+        return {
+            "selected_template": "path",
+            "selected_template_path": template_path,
+            "preset": None
+        }
+    
+    # Check PROMPT_PRESET
+    preset = os.getenv("PROMPT_PRESET", "strict").lower()
+    prompt_dir = os.getenv("PROMPT_DIR", "app/prompts")
+    preset_map = {
+        "strict": "aqtra_strict_en.j2",
+        "support": "aqtra_support_en.j2",
+        "developer": "aqtra_developer_en.j2"
+    }
+    
+    if preset in preset_map:
+        filename = preset_map[preset]
+        project_root = Path(__file__).parent.parent.parent
+        preset_path = project_root / prompt_dir / filename
+        
+        return {
+            "selected_template": f"preset:{preset}",
+            "selected_template_path": str(preset_path),
+            "preset": preset
+        }
+    
+    # Fallback
+    return {
+        "selected_template": "legacy",
+        "selected_template_path": None,
+        "preset": None
+    }
 
