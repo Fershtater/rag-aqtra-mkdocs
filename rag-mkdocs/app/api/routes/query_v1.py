@@ -87,18 +87,27 @@ async def query_documentation(query: Query, request: Request):
             fallback=prompt_settings.fallback_language
         )
         
-        # Settings signature for cache
+        # Settings signature for cache (include template, language, index_version)
+        template_info = get_selected_template_info()
+        template_identifier = template_info.get("selected_template", "legacy")
+        
+        # Get index version
+        index_version = getattr(request.app.state, "index_version", None) or ""
+        
         detector_version = "v1"
         reranking_enabled = os.getenv("RERANKING_ENABLED", "0").lower() in ("1", "true", "yes")
         settings_signature = (
             f"mode={prompt_settings.mode}_"
+            f"template={template_identifier}_"
+            f"lang={response_language}_"
             f"top_k={prompt_settings.default_top_k}_"
             f"temp={prompt_settings.default_temperature}_"
             f"max_tokens={getattr(prompt_settings, 'default_max_tokens', None)}_"
             f"supported={','.join(sorted(prompt_settings.supported_languages))}_"
             f"fallback={prompt_settings.fallback_language}_"
             f"rerank={reranking_enabled}_"
-            f"detector={detector_version}"
+            f"detector={detector_version}_"
+            f"index_version={index_version}"
         )
 
         # Generate cache key

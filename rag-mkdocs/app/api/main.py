@@ -47,13 +47,13 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core.rag_chain import build_rag_chain_and_settings
 from app.infra.db import init_db
+from app.settings import get_settings
 from app.api.routes import (
     health,
     metrics,
@@ -65,31 +65,12 @@ from app.api.routes import (
     escalate,
 )
 
-# Load environment variables from .env file
-load_dotenv()
-
-# Configure logging with LOG_LEVEL support
-env = os.getenv("ENV", "production").lower()
-log_level_str = os.getenv("LOG_LEVEL", "DEBUG" if env == "development" else "INFO")
-log_level = getattr(logging, log_level_str.upper(), logging.INFO)
-
+# Configure logging (will be updated after settings load)
 logging.basicConfig(
-    level=log_level,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-logger.info(f"Logging configured: level={log_level_str}, mode={env}")
-
-# Check for required environment variables on startup
-api_key = os.getenv("OPENAI_API_KEY")
-if api_key is None:
-    logger.error("OPENAI_API_KEY not found in environment variables")
-    raise ValueError(
-        "OPENAI_API_KEY not set in .env\n"
-        "Create .env file from .env.example and add OPENAI_API_KEY=your-key"
-    )
-logger.info("✓ OPENAI_API_KEY found in environment variables")
 
 
 # Pydantic models moved to app.api.schemas
@@ -101,49 +82,90 @@ async def lifespan(app: FastAPI):
     Lifespan context for initialization and resource cleanup.
     
     Executed on startup:
+    - Loads settings
+    - Validates prompt template
     - Loads vectorstore
     - Creates RAG chain
+    - Initializes services
     - Saves to app.state
     
     Executed on shutdown:
     - Cleans up resources
     """
-    # Startup: RAG chain initialization
+    # Startup: Load settings first
     logger.info("=" * 60)
     logger.info("STARTING FASTAPI APPLICATION")
     logger.info("=" * 60)
-    logger.info("Initializing RAG chain...")
     
     try:
-        # Validate prompt template on startup if enabled
-        validate_on_startup = os.getenv("PROMPT_VALIDATE_ON_STARTUP", "1").lower() in ("1", "true", "yes")
-        if validate_on_startup:
-            try:
-                from app.core.prompt_config import get_prompt_template_content, is_jinja_mode
-                from app.core.prompt_renderer import PromptRenderer
-                
-                if is_jinja_mode():
-                    template_str = get_prompt_template_content()
-                    max_chars = int(os.getenv("PROMPT_MAX_CHARS", "40000"))
-                    strict_undefined = os.getenv("PROMPT_STRICT_UNDEFINED", "1").lower() in ("1", "true", "yes")
-                    renderer = PromptRenderer(max_chars=max_chars, strict_undefined=strict_undefined)
-                    renderer.validate_template(template_str)
-                    logger.info("✓ Prompt template validated successfully")
-                else:
-                    logger.info("Prompt template validation skipped (legacy mode)")
-            except Exception as e:
-                logger.error(f"Prompt template validation failed: {e}", exc_info=True)
-                fail_hard = os.getenv("PROMPT_FAIL_HARD", "0").lower() in ("1", "true", "yes")
-                if fail_hard:
-                    raise
-        
-        # Load vectorstore and create RAG chain with settings
+        settings = get_settings()
+    except Exception as e:
+        logger.error(f"Failed to load settings: {e}", exc_info=True)
+        raise
+    
+    # Update logging level from settings
+    log_level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
+    logging.getLogger().setLevel(log_level)
+    logger.info(f"Logging configured: level={settings.LOG_LEVEL}, mode={settings.ENV}")
+    
+    # Save settings to app.state
+    app.state.settings = settings
+    
+    # Validate prompt template on startup if enabled
+    if settings.PROMPT_VALIDATE_ON_STARTUP:
+        try:
+            from app.core.prompt_config import get_prompt_template_content
+            from app.core.prompt_renderer import PromptRenderer
+            
+            # Check if jinja mode
+            if settings.PROMPT_TEMPLATE_MODE == "jinja":
+                template_str = get_prompt_template_content()
+                renderer = PromptRenderer(
+                    max_chars=settings.PROMPT_MAX_CHARS,
+                    strict_undefined=settings.PROMPT_STRICT_UNDEFINED
+                )
+                renderer.validate_template(template_str)
+                logger.info("✓ Prompt template validated successfully")
+            else:
+                logger.info("Prompt template validation skipped (legacy mode)")
+        except Exception as e:
+            logger.error(f"Prompt template validation failed: {e}", exc_info=True)
+            if settings.PROMPT_FAIL_HARD:
+                raise
+            logger.warning("Continuing with legacy prompt mode due to validation failure")
+    
+    # Initialize services
+    from app.services.prompt_service import PromptService
+    from app.services.conversation_service import ConversationService
+    from app.services.answer_service import AnswerService
+    
+    prompt_service = PromptService()
+    conversation_service = ConversationService(sessionmaker=None)  # Will be updated if DB available
+    answer_service = AnswerService(conversation_service, prompt_service)
+    
+    app.state.prompt_service = prompt_service
+    app.state.conversation_service = conversation_service
+    app.state.answer_service = answer_service
+    
+    logger.info("Services initialized")
+    
+    # Load vectorstore and create RAG chain with settings
+    logger.info("Initializing RAG chain...")
+    try:
         rag_chain, vectorstore, prompt_settings = build_rag_chain_and_settings()
+        
+        # Get index version
+        from app.rag.index_meta import get_index_version
+        index_version = get_index_version(settings.VECTORSTORE_DIR)
         
         # Save to app.state for access from endpoints
         app.state.vectorstore = vectorstore
         app.state.rag_chain = rag_chain
         app.state.prompt_settings = prompt_settings
+        app.state.index_version = index_version
+        
+        if index_version:
+            logger.info(f"Index version: {index_version}")
         
         logger.info("RAG chain ready for use")
         logger.info("=" * 60)
@@ -153,14 +175,21 @@ async def lifespan(app: FastAPI):
         app.state.vectorstore = None
         app.state.rag_chain = None
         app.state.prompt_settings = None
+        app.state.index_version = None
 
     # Initialize database for logging if DATABASE_URL is configured
-    db_url = os.getenv("DATABASE_URL")
-    if db_url:
+    if settings.DATABASE_URL:
         try:
             logger.info("Initializing database connection for logging...")
-            db_sessionmaker = await init_db(db_url)
+            db_sessionmaker = await init_db(settings.DATABASE_URL)
             app.state.db_sessionmaker = db_sessionmaker
+            # Update conversation service with sessionmaker
+            app.state.conversation_service = ConversationService(sessionmaker=db_sessionmaker)
+            # Recreate answer service with updated conversation service
+            app.state.answer_service = AnswerService(
+                app.state.conversation_service,
+                app.state.prompt_service
+            )
             logger.info("Database connection successfully initialized")
         except Exception as e:
             logger.error("Failed to initialize database: %s", e, exc_info=True)
@@ -176,7 +205,12 @@ async def lifespan(app: FastAPI):
     app.state.vectorstore = None
     app.state.rag_chain = None
     app.state.prompt_settings = None
+    app.state.index_version = None
     app.state.db_sessionmaker = None
+    app.state.settings = None
+    app.state.prompt_service = None
+    app.state.conversation_service = None
+    app.state.answer_service = None
 
 
 # Create FastAPI application with lifespan
@@ -210,12 +244,14 @@ async def correlation_id_middleware(request: Request, call_next):
 # Add CORS middleware for frontend integration
 # CORS origins configured via environment variable CORS_ORIGINS (comma-separated list)
 # If not specified, "*" is used only in development mode
+# Note: This runs at module level, so we check env directly
 cors_origins_str = os.getenv("CORS_ORIGINS", "")
 if cors_origins_str:
     cors_origins = [origin.strip() for origin in cors_origins_str.split(",") if origin.strip()]
 else:
     # Fallback: allow all only in development
-    cors_origins = ["*"] if env == "development" else []
+    env_mode = os.getenv("ENV", "production").lower()
+    cors_origins = ["*"] if env_mode == "development" else []
 
 app.add_middleware(
     CORSMiddleware,

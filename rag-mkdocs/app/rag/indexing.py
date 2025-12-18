@@ -5,6 +5,7 @@ Indexing module: document loading, chunking, and vectorstore management.
 import hashlib
 import logging
 import os
+import uuid
 from pathlib import Path
 from typing import List, Optional
 
@@ -20,6 +21,8 @@ except ImportError:
 
 from app.core.markdown_utils import extract_sections, slugify
 from app.infra.openai_utils import get_embeddings_client, OPENAI_BATCH_TIMEOUT
+from app.rag.index_meta import generate_index_version, save_index_meta, get_index_version
+from app.rag.index_lock import IndexLock
 
 logger = logging.getLogger(__name__)
 
@@ -271,7 +274,8 @@ def build_or_load_vectorstore(
     chunks: Optional[List[Document]] = None,
     index_path: Optional[str] = None,
     docs_path: str = "data/mkdocs_docs",
-    force_rebuild: bool = False
+    force_rebuild: bool = False,
+    lock_timeout_seconds: int = 300
 ):
     """
     Creates or loads FAISS vector store.
@@ -347,6 +351,11 @@ def build_or_load_vectorstore(
                 allow_dangerous_deserialization=is_dev
             )
             
+            # Load and log index version
+            index_version = get_index_version(index_path)
+            if index_version:
+                logger.info(f"Index version: {index_version}")
+            
             logger.info("Index successfully loaded")
             logger.info(f"Number of documents in index: {vectorstore.index.ntotal}")
             logger.info("=" * 60)
@@ -359,51 +368,156 @@ def build_or_load_vectorstore(
             index_exists = False
     
     if not index_exists or force_rebuild or index_stale:
-        if chunks is None or len(chunks) == 0:
-            logger.info("Chunks not provided, automatically loading documents...")
-            documents = load_mkdocs_documents(docs_path)
-            if not documents:
-                raise ValueError(
-                    f"No documents found in {docs_path}. "
-                    "Make sure directory contains .md files."
+        # Acquire lock for atomic rebuild
+        lock = IndexLock(index_path, timeout_seconds=lock_timeout_seconds)
+        
+        try:
+            if not lock.acquire():
+                lock_info = lock._get_lock_info()
+                lock_file_path = str(lock.lock_file)
+                age_info = f"{lock_info.get('age_seconds', 'unknown')}s" if lock_info else "unknown"
+                pid_info = lock_info.get('pid', 'unknown') if lock_info else 'unknown'
+                
+                logger.warning(
+                    f"Index rebuild lock acquisition failed. "
+                    f"Lock file: {lock_file_path}, Age: {age_info}, PID: {pid_info}"
                 )
-            chunks = chunk_documents(documents)
-            logger.info(f"Automatically loaded and split into {len(chunks)} chunks")
-        
-        if force_rebuild:
-            logger.info("force_rebuild mode: recreating index...")
-        elif index_stale:
-            logger.info("Index is stale: recreating index...")
-        else:
-            logger.info(f"Index not found in {index_path}")
-        
-        logger.info(f"Creating new index from {len(chunks)} chunks...")
-        
-        logger.info("Initializing OpenAI Embeddings (text-embedding-3-small)...")
-        embeddings = get_embeddings_client(timeout=OPENAI_BATCH_TIMEOUT)
-        logger.info(f"Using timeout {OPENAI_BATCH_TIMEOUT}s for batch embedding operations")
-        
-        logger.info("Generating embeddings and creating index...")
-        logger.info("(This may take several minutes for large number of chunks)")
-        
-        vectorstore = FAISS.from_documents(
-            documents=chunks,
-            embedding=embeddings
-        )
-        
-        full_index_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        logger.info(f"Saving index to {index_path}...")
-        vectorstore.save_local(str(full_index_path))
-        
-        docs_hash = _compute_docs_hash(docs_path)
-        if docs_hash:
-            _save_index_hash(index_path, docs_hash)
-        
-        logger.info("Index successfully created and saved")
-        logger.info(f"Number of documents in index: {vectorstore.index.ntotal}")
-        logger.info(f"Vector dimension: {vectorstore.index.d}")
-        logger.info("=" * 60)
-        
-        return vectorstore
+                
+                # Raise RuntimeError for lock failure (will be caught by caller)
+                raise RuntimeError(
+                    f"Index rebuild is already in progress. Lock file: {lock_file_path}, "
+                    f"Age: {age_info}, PID: {pid_info}. Try again later."
+                )
+            
+            # Double-check index existence after acquiring lock
+            # (another process might have created it)
+            if not force_rebuild and not index_stale:
+                index_exists_after_lock = full_index_path.exists() and any(full_index_path.iterdir())
+                if index_exists_after_lock:
+                    # Check staleness again
+                    current_hash = _compute_docs_hash(docs_path)
+                    saved_hash = _load_index_hash(index_path)
+                    if current_hash and saved_hash and current_hash == saved_hash:
+                        logger.info("Index was created by another process, loading it...")
+                        lock.release()
+                        embeddings = get_embeddings_client()
+                        vectorstore = FAISS.load_local(
+                            str(full_index_path),
+                            embeddings,
+                            allow_dangerous_deserialization=is_dev
+                        )
+                        index_version = get_index_version(index_path)
+                        if index_version:
+                            logger.info(f"Index version: {index_version}")
+                        return vectorstore
+            
+            if chunks is None or len(chunks) == 0:
+                logger.info("Chunks not provided, automatically loading documents...")
+                documents = load_mkdocs_documents(docs_path)
+                if not documents:
+                    raise ValueError(
+                        f"No documents found in {docs_path}. "
+                        "Make sure directory contains .md files."
+                    )
+                chunks = chunk_documents(documents)
+                logger.info(f"Automatically loaded and split into {len(chunks)} chunks")
+            
+            if force_rebuild:
+                logger.info("force_rebuild mode: recreating index...")
+            elif index_stale:
+                logger.info("Index is stale: recreating index...")
+            else:
+                logger.info(f"Index not found in {index_path}")
+            
+            # Generate index version
+            index_version = generate_index_version()
+            logger.info(f"Building index version: {index_version}")
+            
+            # Create temporary directory for atomic rebuild
+            tmp_index_path = f"{index_path}.tmp-{uuid.uuid4().hex[:8]}"
+            tmp_full_index_path = project_root / tmp_index_path
+            
+            logger.info("Creating temporary index in %s...", tmp_index_path)
+            
+            logger.info(f"Creating new index from {len(chunks)} chunks...")
+            
+            logger.info("Initializing OpenAI Embeddings (text-embedding-3-small)...")
+            embeddings = get_embeddings_client(timeout=OPENAI_BATCH_TIMEOUT)
+            logger.info(f"Using timeout {OPENAI_BATCH_TIMEOUT}s for batch embedding operations")
+            
+            logger.info("Generating embeddings and creating index...")
+            logger.info("(This may take several minutes for large number of chunks)")
+            
+            vectorstore = FAISS.from_documents(
+                documents=chunks,
+                embedding=embeddings
+            )
+            
+            tmp_full_index_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            logger.info(f"Saving index to temporary location {tmp_index_path}...")
+            vectorstore.save_local(str(tmp_full_index_path))
+            
+            # Save metadata
+            docs_hash = _compute_docs_hash(docs_path)
+            save_index_meta(
+                tmp_index_path,
+                index_version=index_version,
+                docs_hash=docs_hash or "",
+                docs_path=docs_path,
+                embedding_model="text-embedding-3-small",
+                chunk_size=DEFAULT_CHUNK_SIZE,
+                chunk_overlap=DEFAULT_CHUNK_OVERLAP,
+                chunks_count=len(chunks)
+            )
+            
+            if docs_hash:
+                _save_index_hash(tmp_index_path, docs_hash)
+            
+            # Atomic swap: tmp -> index
+            logger.info("Performing atomic swap...")
+            
+            # Remove old backup if exists (keep only one backup)
+            backup_path = project_root / f"{index_path}.bak"
+            if backup_path.exists():
+                import shutil
+                try:
+                    shutil.rmtree(backup_path)
+                    logger.debug(f"Removed old backup: {backup_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove old backup: {e}")
+            
+            # Backup existing index if it exists
+            if full_index_path.exists():
+                try:
+                    full_index_path.rename(backup_path)
+                    logger.info(f"Backed up existing index to {backup_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to backup existing index: {e}")
+            
+            # Atomic swap: tmp -> index
+            try:
+                tmp_full_index_path.rename(full_index_path)
+                logger.info(f"Index successfully swapped: {tmp_index_path} -> {index_path}")
+            except Exception as e:
+                logger.error(f"Failed to swap index: {e}")
+                # Try to restore backup
+                if backup_path.exists():
+                    try:
+                        backup_path.rename(full_index_path)
+                        logger.info("Restored backup index")
+                    except Exception as restore_error:
+                        logger.error("Failed to restore backup: %s", restore_error)
+                raise
+            
+            logger.info("Index successfully created and saved")
+            logger.info(f"Index version: {index_version}")
+            logger.info(f"Number of documents in index: {vectorstore.index.ntotal}")
+            logger.info(f"Vector dimension: {vectorstore.index.d}")
+            logger.info("=" * 60)
+            
+            return vectorstore
+            
+        finally:
+            lock.release()
 

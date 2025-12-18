@@ -48,6 +48,28 @@ if PROMETHEUS_AVAILABLE:
         buckets=[10.0, 30.0, 60.0, 120.0, 300.0, 600.0]
     )
     
+    # Stage histograms
+    rag_retrieval_latency_seconds = Histogram(
+        'rag_retrieval_latency_seconds',
+        'Retrieval stage latency in seconds',
+        ['endpoint'],
+        buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0]
+    )
+    
+    rag_prompt_render_latency_seconds = Histogram(
+        'rag_prompt_render_latency_seconds',
+        'Prompt rendering stage latency in seconds',
+        ['endpoint'],
+        buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
+    )
+    
+    rag_llm_latency_seconds = Histogram(
+        'rag_llm_latency_seconds',
+        'LLM generation stage latency in seconds',
+        ['endpoint'],
+        buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
+    )
+    
     # Gauges
     documents_in_index = Gauge(
         'rag_documents_in_index',
@@ -65,6 +87,9 @@ else:
     rate_limit_hits_total = None
     query_latency_seconds = None
     update_index_duration_seconds = None
+    rag_retrieval_latency_seconds = None
+    rag_prompt_render_latency_seconds = None
+    rag_llm_latency_seconds = None
     documents_in_index = None
     chunks_in_index = None
 

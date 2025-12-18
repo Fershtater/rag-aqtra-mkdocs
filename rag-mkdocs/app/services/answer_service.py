@@ -387,6 +387,10 @@ class AnswerService:
         
         detector_version = "v1"
         reranking_enabled = os.getenv("RERANKING_ENABLED", "0").lower() in ("1", "true", "yes")
+        
+        # Use provided index_version or default to empty
+        index_version_str = index_version or ""
+        
         settings_signature = (
             f"mode={prompt_settings.mode}_"
             f"template={template_identifier}_"
@@ -398,7 +402,8 @@ class AnswerService:
             f"fallback={prompt_settings.fallback_language}_"
             f"rerank={reranking_enabled}_"
             f"detector={detector_version}_"
-            f"history={history_signature}"
+            f"history={history_signature}_"
+            f"index_version={index_version_str}"
         )
         
         cache_key = response_cache._generate_key(request.question, settings_signature)
@@ -424,14 +429,21 @@ class AnswerService:
         # Get template string
         template_str = get_prompt_template_content(prompt_settings)
         
-        # Generate answer
+        # Generate answer with stage timings
         top_k_override = None
         if request.retrieval and request.retrieval.top_k:
             top_k_override = request.retrieval.top_k
         
+        # Stage timings
+        retrieval_start = time_func()
+        prompt_render_start = None
+        prompt_render_end = None
+        llm_start = None
+        llm_end = None
+        
         # For Jinja2 mode, we need context_docs to build source namespace
         if is_jinja_mode():
-            # First call to get context_docs
+            # First call to get context_docs (includes retrieval)
             answer, sources, not_found, context_info = await self.generate_answer(
                 rag_chain,
                 request.question,
@@ -444,6 +456,8 @@ class AnswerService:
                 vectorstore=vectorstore
             )
             
+            retrieval_end = time_func()
+            
             # Build namespaces from context_docs
             context_docs = context_info.get("context_docs", [])
             system_namespace = system_namespace_preview
@@ -452,6 +466,7 @@ class AnswerService:
             tools_namespace = {}
             
             # Render system prompt
+            prompt_render_start = time_func()
             rendered_system_prompt = self.prompt_service.render_system_prompt(
                 template_str,
                 system_namespace,
@@ -460,8 +475,10 @@ class AnswerService:
                 tools_namespace,
                 request_id
             )
+            prompt_render_end = time_func()
             
-            # Regenerate answer with rendered prompt
+            # Regenerate answer with rendered prompt (LLM call)
+            llm_start = time_func()
             answer, sources, not_found, _ = await self.generate_answer(
                 rag_chain,
                 request.question,
@@ -473,11 +490,14 @@ class AnswerService:
                 system_prompt=rendered_system_prompt,
                 vectorstore=vectorstore
             )
+            llm_end = time_func()
         else:
             # Legacy mode: use default system prompt
             response_language = system_namespace_preview["output_language"]
             default_system_prompt = build_system_prompt(prompt_settings, response_language=response_language)
             
+            # In legacy mode, generate_answer includes both retrieval and LLM
+            llm_start = time_func()
             answer, sources, not_found, _ = await self.generate_answer(
                 rag_chain,
                 request.question,
@@ -489,11 +509,47 @@ class AnswerService:
                 system_prompt=default_system_prompt,
                 vectorstore=vectorstore
             )
+            retrieval_end = llm_end = time_func()
+        
+        # Calculate stage timings
+        retrieval_ms = int((retrieval_end - retrieval_start) * 1000) if retrieval_end else 0
+        prompt_render_ms = int((prompt_render_end - prompt_render_start) * 1000) if prompt_render_start and prompt_render_end else 0
+        llm_ms = int((llm_end - llm_start) * 1000) if llm_start and llm_end else 0
+        
+        # Update Prometheus metrics
+        from app.infra.metrics import (
+            rag_retrieval_latency_seconds,
+            rag_prompt_render_latency_seconds,
+            rag_llm_latency_seconds,
+            PROMETHEUS_AVAILABLE,
+        )
+        
+        if PROMETHEUS_AVAILABLE:
+            if rag_retrieval_latency_seconds and retrieval_ms > 0:
+                rag_retrieval_latency_seconds.labels(endpoint=endpoint_name).observe(retrieval_ms / 1000.0)
+            if rag_prompt_render_latency_seconds and prompt_render_ms > 0:
+                rag_prompt_render_latency_seconds.labels(endpoint=endpoint_name).observe(prompt_render_ms / 1000.0)
+            if rag_llm_latency_seconds and llm_ms > 0:
+                rag_llm_latency_seconds.labels(endpoint=endpoint_name).observe(llm_ms / 1000.0)
         
         latency_sec = time_func() - start_time
         latency_ms = int(latency_sec * 1000)
         
         # Build response
+        debug_info = None
+        if request.debug and (request.debug.return_prompt or request.debug.return_chunks):
+            # Add stage timings to debug if debug is enabled
+            debug_info = {
+                "performance": {
+                    "retrieval_ms": retrieval_ms,
+                    "prompt_render_ms": prompt_render_ms,
+                    "llm_ms": llm_ms,
+                    "total_ms": latency_ms
+                }
+            }
+            if request.debug.return_chunks:
+                debug_info["chunks"] = [{"content": s.snippet[:200], "score": s.score} for s in sources[:5]]
+        
         response = AnswerResponse(
             answer=answer,
             sources=sources,
@@ -505,7 +561,8 @@ class AnswerService:
                 cache_hit=False,
                 retrieved_chunks=len(sources),
                 model=None
-            )
+            ),
+            debug=debug_info
         )
         
         # Save to cache (only if no history)

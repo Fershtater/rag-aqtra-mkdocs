@@ -7,7 +7,7 @@ import logging
 from typing import Dict, Optional
 from time import time
 
-from fastapi import APIRouter, Request, Header, JSONResponse
+from fastapi import APIRouter, Request, Header, JSONResponse, HTTPException
 from fastapi.responses import Response
 
 from app.core.rag_chain import (
@@ -17,6 +17,8 @@ from app.core.rag_chain import (
     load_mkdocs_documents,
 )
 from app.core.prompt_config import load_prompt_settings_from_env
+from app.rag.index_meta import get_index_version
+from app.settings import get_settings
 from app.infra.rate_limit import update_limiter
 from app.infra.cache import response_cache
 from app.infra.metrics import (
@@ -58,8 +60,13 @@ async def update_index(
             content={"error": "Rate limit exceeded", "detail": error_msg}
         )
     
+    # Get settings
+    settings = getattr(request.app.state, "settings", None)
+    if not settings:
+        settings = get_settings()
+    
     # Check API key
-    required_api_key = os.getenv("UPDATE_API_KEY")
+    required_api_key = settings.UPDATE_API_KEY
     if not required_api_key:
         logger.warning(f"[{request_id}] UPDATE_API_KEY not set in .env")
         return JSONResponse(
@@ -86,7 +93,7 @@ async def update_index(
         logger.info(f"[{request_id}] Started index update...")
         
         # Load and chunk documents
-        documents = load_mkdocs_documents()
+        documents = load_mkdocs_documents(settings.DOCS_PATH)
         if not documents:
             return JSONResponse(
                 status_code=500,
@@ -96,14 +103,40 @@ async def update_index(
                 }
             )
         
-        chunks = chunk_documents(documents)
+        chunks = chunk_documents(
+            documents,
+            chunk_size=settings.CHUNK_SIZE,
+            chunk_overlap=settings.CHUNK_OVERLAP,
+            min_chunk_size=settings.MIN_CHUNK_SIZE
+        )
         logger.info("Loaded documents, created chunks")
         
-        # Recreate index ONCE
-        vectorstore = build_or_load_vectorstore(
-            chunks=chunks,
-            force_rebuild=True
-        )
+        # Recreate index ONCE (with lock timeout from settings)
+        try:
+            vectorstore = build_or_load_vectorstore(
+                chunks=chunks,
+                force_rebuild=True,
+                lock_timeout_seconds=settings.INDEX_LOCK_TIMEOUT_SECONDS,
+                docs_path=settings.DOCS_PATH,
+                index_path=settings.VECTORSTORE_DIR
+            )
+        except Exception as e:
+            # Check if it's a lock-related error
+            error_str = str(e).lower()
+            if "lock" in error_str or "423" in error_str or "already in progress" in error_str:
+                # Lock acquisition failed
+                logger.warning(f"[{request_id}] Index rebuild lock failed: {e}")
+                if PROMETHEUS_AVAILABLE and update_index_requests_total is not None:
+                    update_index_requests_total.labels(status="error").inc()
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "Index rebuild is already in progress",
+                        "detail": "Try again later"
+                    }
+                )
+            # Re-raise other exceptions
+            raise
         
         # Load prompt settings
         prompt_settings = load_prompt_settings_from_env()
@@ -116,10 +149,14 @@ async def update_index(
             temperature=prompt_settings.default_temperature
         )
         
+        # Get index version after rebuild
+        index_version = get_index_version(settings.VECTORSTORE_DIR)
+        
         # Update app.state
         request.app.state.vectorstore = vectorstore
         request.app.state.rag_chain = rag_chain
         request.app.state.prompt_settings = prompt_settings
+        request.app.state.index_version = index_version
 
         # Cache invalidation of responses after index recreation
         response_cache.clear()

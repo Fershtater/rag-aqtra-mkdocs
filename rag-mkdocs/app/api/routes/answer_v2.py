@@ -108,10 +108,16 @@ async def answer_question(request_data: AnswerRequest, request: Request):
         # Get vectorstore for short-circuit
         vectorstore = getattr(request.app.state, "vectorstore", None)
         
-        # Create services
-        conversation_service = ConversationService(db_sessionmaker)
-        prompt_service = PromptService()
-        answer_service = AnswerService(conversation_service, prompt_service)
+        # Get index version
+        index_version = getattr(request.app.state, "index_version", None)
+        
+        # Get services from app.state (created in lifespan)
+        answer_service = getattr(request.app.state, "answer_service", None)
+        if answer_service is None:
+            # Fallback: create services if not in app.state
+            conversation_service = ConversationService(db_sessionmaker)
+            prompt_service = PromptService()
+            answer_service = AnswerService(conversation_service, prompt_service)
         
         # Process request
         response = await answer_service.process_answer_request(
@@ -122,7 +128,9 @@ async def answer_question(request_data: AnswerRequest, request: Request):
             client_ip,
             request.headers.get("User-Agent"),
             accept_language_header,
-            vectorstore
+            vectorstore,
+            index_version=index_version,
+            endpoint_name="api/answer"
         )
         
         # Update metrics
