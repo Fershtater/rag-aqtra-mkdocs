@@ -10,22 +10,23 @@ A production-ready backend that turns Aqtra's MkDocs content into a searchable, 
 
 This repository contains the backend service that powers a Retrieval-Augmented Generation (RAG) assistant for Aqtra documentation.
 
-It takes the Markdown files from the Aqtra Docs repository (MkDocs-based), indexes them locally with FAISS, and exposes a simple HTTP API that lets you:
+**Core Features:**
 
-- Ask natural-language questions about the documentation
-
-- Get grounded answers that strictly rely on the indexed docs
-
-- See which pages and sections were used as sources
+- **RAG Assistant for MkDocs** — Converts Markdown documentation into a searchable, question-answering API
+- **Strict Mode** — Answers strictly based on documentation with short-circuiting when no relevant sources found
+- **Dual API** — Backward-compatible `/query` (v1) and modern `/api/answer` (v2) endpoints
+- **Server-Sent Events (SSE)** — `/stream` endpoint for real-time answer streaming
+- **Prompt Templating** — Jinja2-based prompt templates with presets (strict, support, developer)
+- **Language Policy** — Multi-language support (en, de, fr, es, pt) with automatic detection
+- **Metrics & Observability** — Prometheus metrics with stage-specific histograms (retrieval, prompt render, LLM)
+- **Atomic Indexing** — File-based locking and atomic rebuilds with version tracking (`index.meta.json`)
 
 The service is designed to be **safe**, **transparent**, and **operationally simple**:
 
 - All embeddings are computed on demand via OpenAI
-
-- The vector index is stored locally as a FAISS index
-
-- Index rebuilds are deterministic and hash-based (only when docs change)
-
+- The vector index is stored locally in `var/vectorstore/faiss_index` (configurable via `VECTORSTORE_DIR`)
+- Index rebuilds are atomic with file-based locking to prevent concurrent rebuilds
+- Index versioning ensures automatic cache invalidation when documentation changes
 - The HTTP API is small, explicit, and easy to integrate into other systems
 
 ---
@@ -80,77 +81,160 @@ Deploy and monitor a small, self-contained service: single FastAPI app, local FA
 
 ## Architecture Overview
 
-At a high level, the service consists of:
+The service follows a layered architecture: **Routers → Services → RAG Modules → Infrastructure**.
 
-- **FastAPI application** (`app/api/main.py`)
+### Request Flow
 
-  - `/health` — health check endpoint
-  - `/query` — RAG question-answering endpoint
-  - `/update_index` — authenticated index rebuild endpoint
-  - `/config/prompt` — current prompt configuration
-  - `/metrics` — Prometheus metrics endpoint
-  - `/escalate` — escalation endpoint to Zoho Desk (for “not found” answers)
+```
+HTTP Request → Router (app/api/routes/*)
+    ↓
+Service Layer (app/services/*)
+    ├─ PromptService: Template rendering, language selection
+    ├─ ConversationService: History management
+    └─ AnswerService: RAG orchestration, short-circuiting
+        ↓
+RAG Modules (app/rag/*)
+    ├─ Retrieval: Vector search with optional reranking
+    ├─ Chain: LangChain RAG chain assembly
+    └─ Indexing: FAISS index management, atomic rebuilds
+        ↓
+Infrastructure (app/infra/*)
+    ├─ OpenAI clients (embeddings, LLM)
+    ├─ Cache (LRU/TTL)
+    ├─ Rate limiting
+    └─ Metrics (Prometheus)
+```
 
-- **RAG pipeline** (`app/core/rag_chain.py`)
+### Component Responsibilities
 
-  - Loads `.md` files from `data/mkdocs_docs/docs/…`
-  - Splits documents into overlapping chunks (Markdown-aware)
-  - Embeds chunks with OpenAI embeddings
-  - Stores vectors in a local FAISS index
-  - Builds a LangChain retrieval + generation chain (`retriever` + `ChatOpenAI`)
+**Routers** (`app/api/routes/`)
 
-- **Infrastructure layer** (`app/infra/…`)
+- Handle HTTP requests/responses
+- Validate input schemas
+- Apply rate limiting
+- Pass requests to services
 
-  - `openai_utils.py` — OpenAI clients, timeouts and retries
-  - `cache.py` — in-memory LRU/TTL response cache
-  - `rate_limit.py` — in-memory rate limiting for `/query`, `/update_index`, `/escalate`
-  - `metrics.py` — Prometheus metrics wiring
-  - `db.py`, `models.py`, `analytics.py` — Postgres logging for queries and escalations
-  - `zoho_desk.py` — Zoho Desk integration for escalation tickets
+**Services** (`app/services/`)
 
-- **Vector store**
+- **PromptService**: Renders Jinja2 templates, selects output language, builds system namespace
+- **ConversationService**: Manages conversation history (if database configured)
+- **AnswerService**: Orchestrates RAG pipeline, handles short-circuiting in strict mode, normalizes sources
 
-  - Stored under `vectorstore/faiss_index` (created at runtime)
-  - Includes FAISS index + metadata
-  - Uses a `.docs_hash` file to detect when documentation has changed
+**RAG Modules** (`app/rag/`)
+
+- **indexing.py**: Document loading, chunking, FAISS index build/load with atomic rebuilds and locking
+- **chain.py**: Assembles LangChain RAG chain (retriever + LLM)
+- **retrieval.py**: Builds retrievers with optional reranking
+- **index_meta.py**: Manages `index.meta.json` with version tracking
+- **index_lock.py**: File-based locking for concurrent rebuild prevention
+
+**Infrastructure** (`app/infra/`)
+
+- **openai_utils.py**: OpenAI client factories with timeouts and retries
+- **cache.py**: In-memory LRU cache with TTL, key includes `index_version` for auto-invalidation
+- **rate_limit.py**: Token bucket rate limiting per endpoint
+- **metrics.py**: Prometheus metrics (counters, histograms, gauges) with stage-specific timings
+
+**Core** (`app/core/`)
+
+- **prompt_config.py**: PromptSettings dataclass, language detection, system prompt builder
+- **prompt_renderer.py**: Safe Jinja2 rendering with sanitization and masking
+- **language_policy.py**: Language selection priority (passthrough > context_hint > Accept-Language > default)
+
+### Where Things Happen
+
+- **Prompt Formation**: `PromptService.build_system_namespace()` → `PromptService.render_prompt()` → `prompt_renderer.render_prompt_template()`
+- **Language Policy**: `language_policy.select_output_language()` (priority: passthrough > context_hint > Accept-Language > default)
+- **Short-Circuit**: `AnswerService._check_short_circuit()` in strict mode when no relevant sources (score < threshold)
+- **Cache Key**: Includes `index_version`, `template`, `language`, `mode`, `history_signature` for proper segmentation
 
 ---
 
-## Project Layout
+## Project Structure
 
 ```bash
 rag-mkdocs/
 ├── app/
-│   ├── __init__.py
 │   ├── api/
-│   │   └── main.py               # FastAPI application (endpoints, logging, app.state)
-│   ├── core/
-│   │   ├── rag_chain.py          # RAG pipeline, indexing logic, FAISS integration
-│   │   ├── markdown_utils.py     # Markdown parsing and URL helpers
-│   │   └── prompt_config.py      # PromptSettings and system prompt builder
-│   └── infra/
-│       ├── openai_utils.py       # OpenAI clients, timeouts, retry helpers
-│       ├── cache.py              # In-memory LRU/TTL response cache
-│       ├── rate_limit.py         # In-memory rate limiting
-│       └── metrics.py            # Prometheus metrics and /metrics endpoint helpers
+│   │   ├── main.py               # FastAPI app, lifespan, app.state initialization
+│   │   ├── deps.py               # Dependency injection (get_settings, get_*_service)
+│   │   ├── routes/               # HTTP route handlers
+│   │   │   ├── query_v1.py      # /query endpoint (v1, backward-compatible)
+│   │   │   ├── answer_v2.py      # /api/answer endpoint (v2)
+│   │   │   ├── stream.py         # /stream endpoint (SSE)
+│   │   │   ├── prompt_debug.py   # /api/prompt/render endpoint
+│   │   │   ├── admin_index.py    # /update_index endpoint
+│   │   │   ├── health.py         # /health endpoint (with diagnostics)
+│   │   │   └── metrics.py        # /metrics endpoint
+│   │   └── schemas/              # Pydantic request/response models
+│   │       ├── v1.py             # v1 API schemas
+│   │       └── v2.py             # v2 API schemas
+│   ├── services/                 # Business logic layer
+│   │   ├── prompt_service.py     # Prompt rendering, language selection
+│   │   ├── conversation_service.py # Conversation history management
+│   │   └── answer_service.py     # RAG orchestration, short-circuiting
+│   ├── rag/                      # RAG pipeline modules
+│   │   ├── indexing.py           # Document loading, chunking, FAISS build/load
+│   │   ├── chain.py              # RAG chain assembly
+│   │   ├── retrieval.py          # Retriever building with reranking
+│   │   ├── index_meta.py         # index.meta.json management, versioning
+│   │   ├── index_lock.py         # File-based locking for rebuilds
+│   │   └── not_found.py          # Not-found detection logic
+│   ├── core/                     # Core utilities
+│   │   ├── prompt_config.py      # PromptSettings, language detection
+│   │   ├── prompt_renderer.py    # Safe Jinja2 rendering
+│   │   ├── language_policy.py    # Language selection priority
+│   │   └── markdown_utils.py     # Markdown parsing, URL building
+│   ├── infra/                    # Infrastructure layer
+│   │   ├── openai_utils.py       # OpenAI client factories
+│   │   ├── cache.py              # LRU/TTL cache with index_version in key
+│   │   ├── rate_limit.py         # Token bucket rate limiting
+│   │   ├── metrics.py            # Prometheus metrics (stage histograms)
+│   │   ├── db.py                 # Database connection (optional)
+│   │   └── analytics.py          # Query logging
+│   ├── prompts/                  # Jinja2 prompt templates
+│   │   ├── aqtra_strict_en.j2    # Strict mode preset
+│   │   ├── aqtra_support_en.j2   # Support mode preset
+│   │   └── aqtra_developer_en.j2 # Developer mode preset
+│   └── settings.py               # Centralized settings (Pydantic BaseSettings)
 ├── scripts/
-│   ├── update_index.py           # CLI script to rebuild the FAISS index
-│   ├── test_api.py               # Manual API smoke tests
-│   ├── check_index.sh            # Health/index/query checks against a running server
-│   └── debug_launch.sh           # Local dev server launcher (uvicorn)
+│   ├── update_index.py           # CLI script to rebuild index
+│   ├── regression_e2e.py        # E2E regression test script (live server)
+│   └── test_api.py               # Manual API smoke tests
 ├── tests/
-│   ├── rag_scenarios.json        # RAG regression scenarios
-│   ├── run_rag_scenarios.py      # CLI runner for regression scenarios
-│   └── test_rag_scenarios.py     # pytest wrapper for regression scenarios
+│   ├── fixtures/                 # Test fixtures
+│   │   └── docs/                 # Sample markdown files for tests
+│   ├── test_regression_offline.py # Offline regression tests (mocked LLM)
+│   ├── test_settings.py          # Settings validation tests
+│   ├── test_index_meta_atomic.py # Index meta/atomic rebuild tests
+│   ├── test_cache_key.py        # Cache key composition tests
+│   └── test_stage_metrics.py    # Stage metrics tests
+├── docs/
+│   └── RUNBOOK.md                # Operational runbook (see below)
 ├── data/
-│   └── mkdocs_docs/              # Aqtra MkDocs documentation (docs/ tree lives here)
-├── vectorstore/
-│   └── .gitkeep                  # FAISS index is created at runtime under vectorstore/faiss_index/
+│   └── mkdocs_docs/              # Documentation source (docs/ tree)
+├── var/                          # Runtime artifacts (gitignored)
+│   ├── vectorstore/              # FAISS index (default: var/vectorstore/faiss_index)
+│   │   └── faiss_index/
+│   │       ├── index.faiss       # FAISS index file
+│   │       ├── index.pkl          # FAISS metadata
+│   │       ├── index.meta.json    # Index metadata (version, hash, config)
+│   │       └── .lock              # Lock file (during rebuild)
+│   └── logs/                     # Application logs
 ├── .env.example                  # Example environment configuration
-├── pyproject.toml                # Poetry configuration (source of truth for deps)
-├── requirements.txt              # Synced pip-compatible dependencies
+├── pyproject.toml                # Poetry configuration
+├── requirements.txt              # pip-compatible dependencies
 └── README.md                     # This file
 ```
+
+**Key Directories:**
+
+- **`app/api/routes/`**: Thin HTTP handlers that delegate to services
+- **`app/services/`**: Business logic, prompt rendering, RAG orchestration
+- **`app/rag/`**: RAG pipeline (indexing, retrieval, chain assembly, index management)
+- **`app/infra/`**: Infrastructure (cache, metrics, rate limiting, OpenAI clients)
+- **`var/`**: Runtime artifacts (index, logs) — **not committed to git**
+- **`docs/RUNBOOK.md`**: Operational guide for deployment and troubleshooting (see [Runbook](#runbook))
 
 ---
 
@@ -273,26 +357,70 @@ data/mkdocs_docs/
    ```
 
 6. **Test the API:**
+
    ```bash
    curl -X POST http://localhost:8000/query \
      -H "Content-Type: application/json" \
      -d '{"question": "How do I create an app?"}'
    ```
 
+7. **Run tests:**
+
+   ```bash
+   # Offline tests (no OpenAI key required)
+   poetry run pytest -q
+
+   # E2E regression (requires running server)
+   poetry run python scripts/regression_e2e.py --base-url http://localhost:8000
+   ```
+
 ### Optional Features
 
 - **Postgres logging:** Set `DATABASE_URL` in `.env` to enable analytics logging.
 - **Zoho Desk escalation:** Configure `ZOHO_*` variables in `.env` to enable `/escalate` endpoint (requires `DATABASE_URL`).
+- **RAG API keys:** Set `RAG_API_KEYS` in `.env` to protect `/api/answer` and `/stream` endpoints (comma-separated).
 
 ---
 
-## Indexing & Updating the Vector Store
+## Indexing & Runtime
 
-The FAISS index is built from the Markdown files under `data/mkdocs_docs/docs/`.
+### Index Location
 
-### One-Time or Manual Rebuild (CLI)
+The FAISS index is stored in `var/vectorstore/faiss_index/` by default (configurable via `VECTORSTORE_DIR`).
 
-You can rebuild the index manually:
+**Important:** The `var/` directory is gitignored and contains runtime artifacts. Never commit index files to version control.
+
+### Index Metadata (`index.meta.json`)
+
+Each index includes a metadata file (`index.meta.json`) with:
+
+- `index_version`: Unique version identifier (timestamp-uuid format)
+- `created_at`: Index creation timestamp
+- `docs_hash`: Hash of source documents
+- `docs_path`: Path to documentation source
+- `embedding_model`: Embedding model used
+- `chunk_size`, `chunk_overlap`: Chunking parameters
+- `chunks_count`: Number of chunks in index
+
+The `index_version` is automatically included in cache keys, ensuring cache invalidation when the index changes.
+
+### Atomic Rebuild & Locking
+
+Index rebuilds are **atomic** and **locked** to prevent concurrent rebuilds:
+
+1. **Lock Acquisition**: File-based lock (`{VECTORSTORE_DIR}.lock`) with configurable timeout (`INDEX_LOCK_TIMEOUT_SECONDS`, default 300s)
+2. **Temporary Build**: Index is built in a temporary directory (`{VECTORSTORE_DIR}.tmp-{uuid}`)
+3. **Atomic Swap**: Old index is backed up, then temporary index is atomically renamed
+4. **Stale Lock Detection**: Locks older than `timeout * 2` are automatically removed
+
+**If rebuild is already in progress:**
+
+- `/update_index` returns `HTTP 409 Conflict` with message: "Index rebuild is already in progress. Try again later."
+- Lock information (PID, age) is logged for debugging
+
+### Rebuild Methods
+
+**CLI (One-time or Manual):**
 
 ```bash
 # Using Poetry
@@ -302,39 +430,32 @@ poetry run python scripts/update_index.py
 python scripts/update_index.py
 ```
 
-This will:
-
-- Load all `.md` files,
-
-- Chunk them,
-
-- Embed them using OpenAI,
-
-- Save the FAISS index under `vectorstore/faiss_index`,
-
-- Write/update a `.docs_hash` file with the current docs signature.
-
-### Rebuild via HTTP (Authenticated)
-
-For automated setups (CI/CD, deploy pipelines), you can trigger a rebuild over HTTP:
+**HTTP (Authenticated, for CI/CD):**
 
 ```bash
 curl -X POST "http://localhost:8000/update_index" \
-  -H "Content-Type: application/json" \
   -H "X-API-Key: $UPDATE_API_KEY" \
   -d '{}'
 ```
 
-The service will:
+**What happens during rebuild:**
 
-- Check the docs hash,
+1. Loads all `.md` files from `DOCS_PATH` (default: `data/mkdocs_docs`)
+2. Chunks documents (Markdown-aware, respects `CHUNK_SIZE`, `CHUNK_OVERLAP`)
+3. Embeds chunks using OpenAI `text-embedding-3-small`
+4. Builds FAISS index in temporary directory
+5. Saves `index.meta.json` with version and metadata
+6. Atomically swaps old index with new one
+7. Updates `app.state.index_version` and clears response cache
 
-- Rebuild the index if needed,
+**Response includes:**
 
-- Replace the in-memory `rag_chain` in `app.state` so new queries use the new index.
-- Clear the in-memory response cache so new queries do not reuse stale answers.
+- `status`: "success"
+- `documents_count`: Number of documents indexed
+- `chunks_count`: Number of chunks created
+- `index_size`: Number of vectors in FAISS index
 
-Response includes basic stats about documents and chunks.
+For detailed operational instructions, see [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 
 ---
 
@@ -530,9 +651,165 @@ The endpoint:
 
 ---
 
+## Prompt Templating
+
+The service supports both **legacy** (hardcoded) and **Jinja2** template modes for system prompts.
+
+### Template Modes
+
+**Legacy Mode** (default):
+
+- Uses `build_system_prompt()` function
+- Simple, English-only prompts
+- No template files
+
+**Jinja2 Mode**:
+
+- Dynamic template rendering with variables
+- Supports presets or custom templates
+- Enables advanced prompt engineering
+
+### Configuration
+
+Set `PROMPT_TEMPLATE_MODE=jinja` to enable Jinja2 mode:
+
+```env
+PROMPT_TEMPLATE_MODE=jinja          # "legacy" or "jinja"
+PROMPT_PRESET=strict                 # "strict", "support", or "developer"
+PROMPT_DIR=app/prompts              # Directory for preset templates
+PROMPT_TEMPLATE_PATH=custom/path.j2 # Custom template file (optional)
+PROMPT_TEMPLATE={{ custom inline }}  # Inline template string (optional)
+```
+
+**Template Selection Priority:**
+
+1. `PROMPT_TEMPLATE` (inline string) — highest priority
+2. `PROMPT_TEMPLATE_PATH` (file path)
+3. `PROMPT_PRESET` (from `PROMPT_DIR`)
+4. Legacy `build_system_prompt()` — fallback
+
+### Available Presets
+
+- **`strict`**: Strict documentation-based answers (`aqtra_strict_en.j2`)
+- **`support`**: Support-oriented, more conversational (`aqtra_support_en.j2`)
+- **`developer`**: Developer-focused, technical details (`aqtra_developer_en.j2`)
+
+### Template Variables
+
+Jinja2 templates have access to namespaces:
+
+- **`system`**: System-level variables (output_language, mode, etc.)
+- **`source`**: Retrieved document chunks (content, metadata)
+- **`passthrough`**: User-provided passthrough data (sanitized)
+- **`tools`**: Available tools/functions
+
+**Security:**
+
+- Passthrough data is sanitized (primitives only, max depth/items)
+- Secrets (keys, tokens, passwords) are automatically masked as `***MASKED***`
+- `PROMPT_MAX_CHARS` (default 40000) limits total rendered prompt size
+- Source content is truncated if needed, but system/passthrough are preserved
+
+### Testing Templates
+
+Use `/api/prompt/render` endpoint to preview rendered prompts:
+
+```bash
+curl -X POST "http://localhost:8000/api/prompt/render" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "test",
+    "api_key": "your-key"
+  }'
+```
+
+Response includes:
+
+- `selected_template`: Which template was used (inline/path/preset/legacy)
+- `output_language`: Selected output language
+- `rendered_prompt`: Full rendered system prompt
+
+### Validation
+
+Set `PROMPT_VALIDATE_ON_STARTUP=true` to validate templates on service startup:
+
+```env
+PROMPT_VALIDATE_ON_STARTUP=true     # Validate on startup
+PROMPT_FAIL_HARD=true               # Fail startup if validation fails
+PROMPT_STRICT_UNDEFINED=true        # Strict undefined variables in Jinja2
+```
+
+---
+
+## Language Policy
+
+The service supports **multi-language responses** while keeping repository content and system prompts **English-only**.
+
+### Supported Languages
+
+- **EN** (English) — default
+- **DE** (German)
+- **FR** (French)
+- **ES** (Spanish)
+- **PT** (Portuguese)
+
+Configure via `PROMPT_SUPPORTED_LANGUAGES` (comma-separated):
+
+```env
+PROMPT_SUPPORTED_LANGUAGES=en,de,fr,es,pt
+PROMPT_FALLBACK_LANGUAGE=en
+```
+
+### Language Selection Priority
+
+Output language is determined by this priority (highest to lowest):
+
+1. **`passthrough.language`** — Explicit language in request
+2. **`context_hint.language`** — Language hint from context
+3. **`Accept-Language` HTTP header** — Browser/client language preference
+4. **Default** — `PROMPT_FALLBACK_LANGUAGE` (default: "en")
+
+### Examples
+
+**Explicit language (passthrough):**
+
+```bash
+curl -X POST "http://localhost:8000/api/answer" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "How do I create an app?",
+    "api_key": "your-key",
+    "passthrough": {"language": "fr"}
+  }'
+```
+
+**Accept-Language header:**
+
+```bash
+curl -X POST "http://localhost:8000/api/answer" \
+  -H "Content-Type: application/json" \
+  -H "Accept-Language: fr-FR,fr;q=0.9" \
+  -d '{
+    "question": "Comment créer une application?",
+    "api_key": "your-key"
+  }'
+```
+
+**Language Detection:**
+
+- If user question contains German/French/Spanish/Portuguese patterns, language is auto-detected
+- Cyrillic characters (Russian, etc.) automatically trigger English fallback
+- Unsupported languages fall back to `PROMPT_FALLBACK_LANGUAGE`
+
+### Language in Cache Key
+
+The selected `output_language` is included in the cache key, ensuring different languages produce different cached responses.
+
+---
+
 ## Prompt Configuration
 
-The system prompt and RAG behavior settings are centralized in `app/core/prompt_config.py` using the `PromptSettings` dataclass.
+The system prompt and RAG behavior settings are centralized in `app/settings.py` using Pydantic `BaseSettings`.
 
 ### Configuration via Environment Variables (Prompt / RAG)
 
@@ -798,52 +1075,207 @@ ESCALATE_RATE_WINDOW_SECONDS=3600
 
 ---
 
-## RAG Regression Checks
+## Testing
 
-To make sure that core RAG behaviour is not accidentally broken by future changes, the repository includes a small set of
-**regression scenarios** under `tests/`.
+The repository includes multiple testing strategies: **offline unit tests** (no OpenAI key required) and **online E2E tests** (against live server).
 
-These scenarios are intentionally simple and focus on **invariants**, not on exact wording:
+**Related Documentation:**
 
-- For a given question, the answer **must not** contain a “not found in documentation” message (for known flows).
-- For a given question, the answer **must** contain a “not found” message (for out-of-scope questions).
-- Certain questions are expected to retrieve sources from specific parts of the documentation tree
-  (for example, `app-development/ui-components/label` or `user-interface/localizations`).
+- [`docs/PRODUCTION_CHECKLIST.md`](docs/PRODUCTION_CHECKLIST.md) - Production deployment checklist
+- [`docs/RUNBOOK.md`](docs/RUNBOOK.md) - Operational runbook
+- [`REGRESSION_TEST_SUMMARY.md`](REGRESSION_TEST_SUMMARY.md) - Regression test details
 
-### Running the RAG server
+### Offline Tests (pytest)
 
-First, start the RAG service locally (for example, using Poetry):
+**Run all offline tests:**
 
 ```bash
-poetry run uvicorn app.api.main:app --reload --port 8000
+poetry run pytest -q
 ```
 
-or use the provided `debug_launch.sh` helper if you prefer a single command.
+**Key test files:**
 
-### Running regression scenarios via CLI
+- `test_regression_offline.py` — Full RAG pipeline regression with mocked LLM
+- `test_settings.py` — Settings validation and defaults
+- `test_index_meta_atomic.py` — Index metadata and atomic rebuild logic
+- `test_cache_key.py` — Cache key composition (template, language, index_version)
+- `test_stage_metrics.py` — Prometheus stage metrics labeling
 
-With the server running, execute:
+**Offline regression tests** (`test_regression_offline.py`):
+
+- Use **mocked LLM** (no real OpenAI calls)
+- Build test index from fixtures (`tests/fixtures/docs/`)
+- Test retrieval, strict mode short-circuiting, cache keys, prompt rendering safety
+- All tests are **deterministic** and run without `OPENAI_API_KEY`
+
+**What they verify:**
+
+- ✅ Retrieval works and returns sources
+- ✅ Strict mode short-circuits when no relevant sources
+- ✅ Cache keys differ for different templates/languages/index versions
+- ✅ Prompt rendering masks secrets and respects max chars
+- ✅ Sources are normalized correctly
+
+### Online E2E Tests (Live Server)
+
+**E2E regression script** (`scripts/regression_e2e.py`):
+
+- Tests a **running server** (requires `OPENAI_API_KEY` in server environment)
+- Verifies all endpoints end-to-end
+- Returns exit code 0 on success, non-zero on failure
+
+**Usage:**
+
+```bash
+# Start server first
+poetry run uvicorn app.api.main:app --reload --port 8000
+
+# In another terminal, run E2E tests
+poetry run python scripts/regression_e2e.py \
+  --base-url http://localhost:8000 \
+  --api-key your-rag-api-key \
+  --update-key your-update-api-key
+```
+
+**What it tests:**
+
+- ✅ `/health` endpoint (with and without `X-Debug: 1`)
+- ✅ `/api/prompt/render` (template selection, language)
+- ✅ `/api/answer` (positive case with sources, negative case with short-circuit)
+- ✅ `/stream` (SSE event order)
+- ✅ `/metrics` (stage histograms presence)
+- ✅ `/update_index` (optional, checks index_version change)
+
+**Output:**
+
+- Color-coded PASS/FAIL for each test
+- Summary with total passed/failed
+- Exit code 0 if all pass, 1 if any fail
+
+### RAG Regression Scenarios
+
+Legacy regression scenarios (`tests/rag_scenarios.json`) focus on **invariants**:
+
+- Known questions should **not** return "not found"
+- Out-of-scope questions **should** return "not found"
+- Sources should match expected documentation sections
+
+**Run scenarios:**
 
 ```bash
 export RAG_BASE_URL=http://localhost:8000
 poetry run python tests/run_rag_scenarios.py
 ```
 
-The script will:
+### CI/CD Integration
 
-- Load scenarios from `tests/rag_scenarios.json`.
-- For each scenario, send a `POST /query` request with the specified `question`.
-- Verify:
-  - `must_contain`: all required substrings are present in the `answer` (case-insensitive).
-  - `must_not_contain`: none of the forbidden substrings are present in the `answer`.
-  - `required_sources`: each required substring appears in at least one of `source`, `url` or `section_title`.
-- Print `✔` / `❌` for each scenario and a final summary.
-- Exit with code `0` if all scenarios pass, or a non-zero code if any scenario fails.
+**Recommended CI pipeline:**
 
-These checks are **sanity checks**, not a formal quality benchmark, but they provide a quick way to ensure that:
+1. **Offline tests** (no secrets required):
+   ```bash
+   pytest -q
+   ```
+2. **Online E2E** (requires running server with `OPENAI_API_KEY`):
+   ```bash
+   python scripts/regression_e2e.py --base-url $SERVER_URL
+   ```
 
-- Known happy-path questions still resolve to the right parts of the docs.
-- Out-of-scope questions are handled with a clear “not found in documentation” style answer.
+**Note:** E2E tests require a running server. In CI, you may need to:
+
+- Start server in background
+- Wait for health check
+- Run E2E tests
+- Stop server
+
+For local development, run offline tests frequently, E2E tests before commits.
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+**"not_found" too often:**
+
+- Check `NOT_FOUND_SCORE_THRESHOLD` (default: 0.20) — lower threshold = more lenient
+- Verify index is up-to-date: check `index_version` in `/health` diagnostics
+- Check retrieval quality: review `sources` in responses, verify chunks are relevant
+
+**Index locked (409 Conflict):**
+
+- Another rebuild is in progress — wait for it to complete
+- Check lock file: `ls -la var/vectorstore/faiss_index.lock`
+- If lock is stale (older than `INDEX_LOCK_TIMEOUT_SECONDS * 2`), it will be auto-removed
+- **Manual removal** (only if sure no rebuild is running):
+  ```bash
+  rm var/vectorstore/faiss_index.lock
+  ```
+- See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for detailed lock troubleshooting
+
+**Prompt too long:**
+
+- Check `PROMPT_MAX_CHARS` (default: 40000)
+- Reduce `PROMPT_DEFAULT_TOP_K` to retrieve fewer chunks
+- Enable source content truncation (already enabled by default)
+
+**Index not loading:**
+
+- Verify index exists: `ls -la var/vectorstore/faiss_index/`
+- Check `index.meta.json` is present and valid
+- Review startup logs for errors
+- Rebuild index: `/update_index` or `python scripts/update_index.py`
+
+**Cache not invalidating:**
+
+- Verify `index_version` is included in cache key (check logs)
+- Check `index_version` changed after rebuild (see `/health` with `X-Debug: 1`)
+- Manually clear cache: restart server
+
+**Strict mode not working:**
+
+- Verify `PROMPT_MODE=strict` in settings
+- Check `STRICT_SHORT_CIRCUIT=true` (default)
+- Verify `NOT_FOUND_SCORE_THRESHOLD` is appropriate (default: 0.20)
+- Check logs for short-circuit messages
+
+**Language not matching expected:**
+
+- Check `PROMPT_SUPPORTED_LANGUAGES` includes desired language
+- Verify language selection priority: passthrough > context_hint > Accept-Language > default
+- Check logs for `language_reason` to see why language was selected
+- Test with explicit `passthrough.language` in request
+
+### Where to Look
+
+**Logs:**
+
+- Application logs: `var/logs/` (if configured) or stdout/stderr
+- Look for `request_id` in logs for request tracing
+- Stage timings in debug mode: `response.debug.performance`
+
+**Metrics:**
+
+- `/metrics` endpoint: Prometheus format
+- Stage histograms: `rag_retrieval_latency_seconds`, `rag_prompt_render_latency_seconds`, `rag_llm_latency_seconds`
+- Request counts: `rag_query_requests_total{status}`
+
+**Health Diagnostics:**
+
+- `/health` with `X-Debug: 1` header (or `ENV != production`)
+- Shows: env, log_level, prompt config, vectorstore_dir, index_version, cache settings, rate limits
+- **No secrets** are exposed in diagnostics
+
+**Index State:**
+
+- `var/vectorstore/faiss_index/index.meta.json` — index metadata
+- `var/vectorstore/faiss_index.lock` — lock file (if rebuild in progress)
+- Check `index_version` in health diagnostics
+
+**Related Documentation:**
+
+- [`docs/PRODUCTION_CHECKLIST.md`](docs/PRODUCTION_CHECKLIST.md) - Production deployment checklist
+- [`docs/RUNBOOK.md`](docs/RUNBOOK.md) - Operational runbook
+- [`REGRESSION_TEST_SUMMARY.md`](REGRESSION_TEST_SUMMARY.md) - Regression test details
 
 ---
 
@@ -852,7 +1284,6 @@ These checks are **sanity checks**, not a formal quality benchmark, but they pro
 Logging is configured based on environment:
 
 - `ENV=development` → default `LOG_LEVEL=DEBUG`
-
 - `ENV=production` → default `LOG_LEVEL=INFO` (if not overridden)
 
 You can set `LOG_LEVEL` explicitly in `.env`:
@@ -864,29 +1295,39 @@ LOG_LEVEL=DEBUG   # TRACE-level details about indexing and RAG
 Typical log events include:
 
 - Document discovery and counting
-
 - Chunking stats
-
 - Index build/load events
-
-- Docs hash changes
-
+- Index version and metadata
+- Lock acquisition/release
 - RAG query handling and error traces
+- Stage timings (retrieval, prompt render, LLM) in debug mode
+
+---
+
+## Runbook
+
+For detailed operational instructions, see [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+
+The runbook covers:
+
+- Service launch and configuration
+- Index management and rebuild procedures
+- Lock handling and stale lock cleanup
+- Debug and diagnostics
+- Language policy verification
+- Monitoring and metrics
 
 ---
 
 ## Security Notes
 
 - The `/update_index` endpoint is secured with an API key (`UPDATE_API_KEY` via `X-API-Key` header).
-
+- `/api/answer` and `/stream` can be protected with `RAG_API_KEYS` (comma-separated, optional — open mode if not set).
 - FAISS `allow_dangerous_deserialization` is **disabled** by default (`ENV=production`).
-
+- Secrets are automatically masked in prompt rendering and diagnostics.
 - The service is intended to be deployed behind an API gateway / reverse proxy that can:
-
   - Handle rate limiting
-
   - Add authentication/authorization around `/query` if needed
-
   - Terminate TLS
 
 For internet-facing deployments, treat this as an internal microservice and expose it only via controlled entry points.

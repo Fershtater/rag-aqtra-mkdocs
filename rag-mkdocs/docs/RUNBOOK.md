@@ -1,99 +1,184 @@
 # RAG Service Runbook
 
-Краткое руководство по эксплуатации RAG сервиса.
+Operational runbook for the Aqtra RAG Documentation Assistant (FastAPI + local vector index).
 
-## Запуск сервиса
+This document focuses on **how to run**, **how to rebuild the index safely**, **how to debug**, and **how to validate behavior**.
 
-### Установка зависимостей
+---
+
+## 1) Start the service
+
+### Install dependencies
 
 ```bash
 poetry install
-# или
+# or
 pip install -r requirements.txt
+````
+
+### Configure environment
+
+Create `.env` from `.env.example`:
+
+```bash
+cp .env.example .env
 ```
 
-### Настройка окружения
+Minimum required variables:
 
-Создайте `.env` файл из `.env.example` и настройте минимум:
-- `OPENAI_API_KEY` - обязательный
-- `UPDATE_API_KEY` - для `/update_index` endpoint
-- `RAG_API_KEYS` - для `/api/answer` и `/stream` (опционально, если не задан - открытый доступ)
+* `OPENAI_API_KEY` — required for real embeddings + LLM (online mode)
+* `UPDATE_API_KEY` — required to use `/update_index`
+* `RAG_API_KEYS` — optional protection for `/api/answer`, `/stream`, `/api/prompt/render` (if empty → open mode)
 
-### Запуск сервера
+Recommended baseline for production:
+
+* `ENV=production`
+* `LOG_LEVEL=INFO`
+* `PROMPT_LOG_RENDERED=0` (avoid logging rendered prompts in prod)
+
+### Run the server
+
+```bash
+poetry run uvicorn app.api.main:app --host 0.0.0.0 --port 8000
+```
+
+Dev mode:
 
 ```bash
 poetry run uvicorn app.api.main:app --reload --port 8000
-# или
-uvicorn app.api.main:app --reload --port 8000
 ```
 
-Сервер будет доступен на `http://localhost:8000`
+Service will be available at `http://localhost:8000`.
 
-## Управление индексом
+---
 
-### Где лежит индекс
+## 2) Runtime paths & artifacts
 
-Индекс хранится в `var/vectorstore/faiss_index/` (настраивается через `VECTORSTORE_DIR`).
+### Vector index location
 
-### Пересборка индекса
+The index is stored under:
 
-#### Через HTTP endpoint (рекомендуется)
+* `VECTORSTORE_DIR` (default): `var/vectorstore/faiss_index/`
+
+This directory is **runtime-only** and should not be committed to git.
+
+### Lock file
+
+Index rebuild uses a file lock:
+
+* lock path: `{VECTORSTORE_DIR}.lock`
+
+  * example: `var/vectorstore/faiss_index.lock`
+
+The lock prevents concurrent rebuilds.
+
+---
+
+## 3) Index management
+
+### Rebuild index via HTTP (recommended)
 
 ```bash
 curl -X POST "http://localhost:8000/update_index" \
-  -H "X-API-Key: your-update-api-key"
+  -H "X-API-Key: $UPDATE_API_KEY" \
+  -d '{}'
 ```
 
-#### Через CLI скрипт
+Expected behavior:
+
+* If another rebuild is running, the server returns **HTTP 409 Conflict** with a clear message.
+* Rebuild is **atomic**: built in a temp directory and swapped into place.
+
+### Rebuild index via CLI
 
 ```bash
 poetry run python scripts/update_index.py
 ```
 
-### index.meta.json и index_version
+### Index metadata: `index.meta.json` and `index_version`
 
-При каждой пересборке создается файл `index.meta.json` с метаданными:
-- `index_version` - уникальная версия индекса (timestamp-uuid)
-- `created_at` - время создания
-- `docs_hash` - хеш документов
-- `chunks_count` - количество чанков
-- и другие параметры
+Each built index includes `index.meta.json` in `VECTORSTORE_DIR` with metadata like:
 
-`index_version` используется для автоматической инвалидации кэша при смене индекса.
+* `index_version` — unique index version (timestamp/uuid)
+* `created_at`
+* `docs_hash` — hash of the documentation input
+* `chunks_count`
+* embedding model + chunking params (if included)
 
-### Что делать если rebuild "завис"
+`index_version` is used to automatically **invalidate the response cache** when the index changes.
 
-Если `/update_index` возвращает ошибку `423 Locked`:
+---
 
-1. **Проверьте lock файл:**
-   ```bash
-   ls -la var/vectorstore/faiss_index.lock
-   ```
+## 4) Handling index lock issues
 
-2. **Проверьте возраст lock:**
-   - Если lock старше `INDEX_LOCK_TIMEOUT_SECONDS * 2` (по умолчанию 600 секунд), он считается stale
-   - Stale lock автоматически удаляется при следующей попытке
+### If `/update_index` returns `409 Conflict`
 
-3. **Принудительное удаление lock (только если уверены):**
-   ```bash
-   rm var/vectorstore/faiss_index.lock
-   ```
-   ⚠️ **Внимание:** Удаляйте lock только если уверены, что другой процесс rebuild не выполняется.
+This means a rebuild is already in progress.
 
-4. **Проверьте логи:**
-   - Lock информация логируется с PID и возрастом
-   - Ищите сообщения типа "Failed to acquire lock" или "Stale lock detected"
+1. Inspect lock file:
 
-## Debug и диагностика
+```bash
+ls -la var/vectorstore/faiss_index.lock
+```
 
-### Включение debug.performance в /api/answer
+2. Check logs:
 
-Добавьте в запрос поле `debug`:
+* look for messages indicating lock acquisition failure and lock age/PID (if recorded).
+
+### Stale lock behavior
+
+Locks older than `INDEX_LOCK_TIMEOUT_SECONDS * 2` are considered stale and should be automatically removed by the service (with a warning log).
+
+### Manual lock removal (ONLY if you are sure no rebuild is running)
+
+```bash
+rm var/vectorstore/faiss_index.lock
+```
+
+⚠️ Removing the lock while another rebuild is running can corrupt runtime behavior.
+
+---
+
+## 5) Debugging & diagnostics
+
+### Health check
+
+Basic:
+
+```bash
+curl http://localhost:8000/health
+```
+
+Diagnostics (enabled only when `ENV != production` OR by forcing header):
+
+```bash
+curl -H "X-Debug: 1" http://localhost:8000/health
+```
+
+Diagnostics must not contain secrets (keys/tokens are masked).
+
+### Prompt preview (Jinja / template debug)
+
+Use `/api/prompt/render` to verify:
+
+* which template was selected (inline/path/preset/legacy),
+* `output_language` and selection reason,
+* a preview of rendered prompt and namespaces.
+
+```bash
+curl -X POST "http://localhost:8000/api/prompt/render" \
+  -H "Content-Type: application/json" \
+  -d '{"question":"test","api_key":"YOUR_RAG_KEY"}'
+```
+
+### Enable stage timings in `/api/answer`
+
+If supported by the API request schema, include a `debug` object to get `debug.performance`:
 
 ```json
 {
   "question": "test",
-  "api_key": "your-key",
+  "api_key": "YOUR_RAG_KEY",
   "debug": {
     "return_prompt": false,
     "return_chunks": true
@@ -101,114 +186,132 @@ poetry run python scripts/update_index.py
 }
 ```
 
-В ответе появится поле `debug.performance` с таймингами:
-- `retrieval_ms` - время retrieval
-- `prompt_render_ms` - время рендеринга промпта
-- `llm_ms` - время генерации LLM
-- `total_ms` - общее время
+Typical timings:
 
-### Health check с диагностикой
+* `retrieval_ms`
+* `prompt_render_ms`
+* `llm_ms`
+* `total_ms`
 
-#### Базовый health check
+---
 
-```bash
-curl http://localhost:8000/health
-```
+## 6) Language policy verification
 
-#### Health check с диагностикой (только в development или с заголовком)
+Supported output languages: `en`, `fr`, `de`, `es`, `pt` (configurable via `PROMPT_SUPPORTED_LANGUAGES`).
 
-```bash
-# В development режиме
-ENV=development uvicorn app.api.main:app
+Language selection priority:
 
-# Или с заголовком X-Debug
-curl -H "X-Debug: 1" http://localhost:8000/health
-```
+1. `passthrough.language`
+2. `context_hint.language`
+3. `Accept-Language` header
+4. default: English
 
-В ответе появится поле `diagnostics` с конфигурацией (без секретов).
-
-### Проверка языковой политики
-
-Язык ответа определяется приоритетом:
-1. `passthrough.language` в запросе
-2. `context_hint.language` в запросе
-3. `Accept-Language` HTTP заголовок
-4. Default: English
-
-Проверка через `Accept-Language`:
+Test with `Accept-Language`:
 
 ```bash
 curl -X POST "http://localhost:8000/api/answer" \
   -H "Content-Type: application/json" \
   -H "Accept-Language: fr-FR,fr;q=0.9" \
-  -d '{"question": "test", "api_key": "your-key"}'
+  -d '{"question":"test","api_key":"YOUR_RAG_KEY"}'
 ```
 
-Поддерживаемые языки: `en`, `fr`, `de`, `es`, `pt` (настраивается через `PROMPT_SUPPORTED_LANGUAGES`).
+---
 
-## Мониторинг
+## 7) Strict mode & short-circuit behavior
 
-### Prometheus метрики
+In strict mode, if no relevant sources are found:
+
+* `not_found=true`
+* `sources=[]`
+* The service returns a fixed “not enough information in the documentation” message
+* **LLM is not called** (cost-saving and hallucination prevention)
+
+This is the intended behavior and should be validated before production.
+
+---
+
+## 8) Monitoring
+
+### Prometheus metrics
 
 ```bash
 curl http://localhost:8000/metrics
 ```
 
-Доступные метрики:
-- `rag_query_requests_total{status}` - количество запросов
-- `rag_query_latency_seconds` - латентность запросов
-- `rag_retrieval_latency_seconds{endpoint}` - латентность retrieval
-- `rag_prompt_render_latency_seconds{endpoint}` - латентность рендеринга промпта
-- `rag_llm_latency_seconds{endpoint}` - латентность LLM
-- `rag_update_index_requests_total{status}` - количество пересборок индекса
-- `rag_documents_in_index` - количество документов в индексе
+Key metrics include:
 
-### Логи
+* request counters (success/error)
+* latency histograms (including stage timings)
+* index size / documents counts (if exposed)
 
-Логи включают:
-- `request_id` для трейсинга запросов
-- Stage timings в debug режиме
-- Lock информация при rebuild
-- Index version при загрузке
+Stage histograms (examples):
 
-## Конфигурация
+* `rag_retrieval_latency_seconds{endpoint}`
+* `rag_prompt_render_latency_seconds{endpoint}`
+* `rag_llm_latency_seconds{endpoint}`
 
-Основные настройки в `.env`:
+### Logs
 
-- `VECTORSTORE_DIR` - путь к индексу (default: `var/vectorstore/faiss_index`)
-- `DOCS_PATH` - путь к документам (default: `data/mkdocs_docs`)
-- `PROMPT_TEMPLATE_MODE` - режим промпта: `legacy` или `jinja`
-- `PROMPT_PRESET` - пресет промпта: `strict`, `support`, `developer`
-- `PROMPT_VALIDATE_ON_STARTUP` - валидация промпта при старте (default: `true`)
-- `INDEX_LOCK_TIMEOUT_SECONDS` - timeout для lock (default: `300`)
-- `CACHE_TTL_SECONDS` - TTL кэша (default: `600`)
-- `CACHE_MAX_SIZE` - размер кэша (default: `500`)
+Logs should include:
 
-Полный список настроек см. в `app/settings.py`.
+* `request_id` for tracing
+* index load/build events, `index_version`
+* lock events (acquire/fail/stale cleanup)
+* short-circuit events in strict mode (when triggered)
 
-## Troubleshooting
+---
 
-### Индекс не загружается
+## 9) Regression testing
 
-1. Проверьте наличие индекса: `ls -la var/vectorstore/faiss_index/`
-2. Проверьте логи при старте
-3. Пересоберите индекс: `/update_index`
+### Offline regression (no OpenAI key)
 
-### Кэш не инвалидируется
+Runs deterministic tests with mocked LLM:
 
-1. Проверьте `index_version` в health diagnostics
-2. Убедитесь, что `index_version` включен в cache key (проверьте логи)
-3. Очистите кэш вручную (перезапустите сервер)
+```bash
+poetry run pytest -q
+```
 
-### Strict mode не работает
+### Online E2E regression (requires running server)
 
-1. Проверьте `PROMPT_MODE=strict` в настройках
-2. Проверьте `STRICT_SHORT_CIRCUIT=true`
-3. Проверьте `NOT_FOUND_SCORE_THRESHOLD` (default: `0.20`)
+```bash
+poetry run python scripts/regression_e2e.py \
+  --base-url http://localhost:8000 \
+  --api-key YOUR_RAG_KEY \
+  --update-key YOUR_UPDATE_KEY
+```
 
-### Язык ответа не соответствует ожидаемому
+---
 
-1. Проверьте `PROMPT_SUPPORTED_LANGUAGES` (должен включать нужный язык)
-2. Проверьте приоритет: passthrough > context_hint > Accept-Language > default
-3. Проверьте логи для `language_reason`
+## 10) Troubleshooting
+
+### “not_found” happens too often
+
+* Check `NOT_FOUND_SCORE_THRESHOLD` (lower threshold = more lenient)
+* Ensure index is up to date (`index_version` changed after rebuild)
+* Validate your docs path (`DOCS_PATH`) and that documents are actually indexed
+
+### Index does not load
+
+* Verify `VECTORSTORE_DIR` exists and contains index files + `index.meta.json`
+* Rebuild via `/update_index` or CLI
+* Check startup logs for index load errors
+
+### Cache does not invalidate after index rebuild
+
+* Confirm `index_version` changed (via health diagnostics)
+* Restart service as a last resort (clears in-memory cache)
+
+### Output language does not match expectations
+
+* Confirm `PROMPT_SUPPORTED_LANGUAGES` includes the desired language
+* Check `language_reason` via `/api/prompt/render` or debug logs
+* Force language via `passthrough.language`
+
+---
+
+## References
+
+* `docs/PRODUCTION_CHECKLIST.md`
+* `REGRESSION_TEST_SUMMARY.md`
+* `README.md`
 
