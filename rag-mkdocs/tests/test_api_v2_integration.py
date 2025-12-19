@@ -10,11 +10,13 @@ import json
 import pytest
 import requests
 
+from tests._integration_utils import get_base_url, wait_for_health
+
 
 @pytest.mark.integration
 def test_health_check():
     """Check that server is alive."""
-    base_url = (os.getenv("RAG_BASE_URL") or "http://localhost:8000").rstrip("/")
+    base_url = get_base_url()
     
     try:
         resp = requests.get(f"{base_url}/health", timeout=2)
@@ -27,7 +29,7 @@ def test_health_check():
 @pytest.mark.integration
 def test_api_answer_basic():
     """Test POST /api/answer with basic question (no history)."""
-    base_url = (os.getenv("RAG_BASE_URL") or "http://localhost:8000").rstrip("/")
+    base_url = get_base_url()
     
     # Quick health check
     try:
@@ -72,7 +74,7 @@ def test_api_answer_basic():
 @pytest.mark.integration
 def test_api_answer_with_history_string():
     """Test POST /api/answer with history as JSON string."""
-    base_url = (os.getenv("RAG_BASE_URL") or "http://localhost:8000").rstrip("/")
+    base_url = get_base_url()
     
     try:
         resp = requests.get(f"{base_url}/health", timeout=2)
@@ -106,7 +108,7 @@ def test_api_answer_with_history_string():
 @pytest.mark.integration
 def test_api_answer_with_history_array():
     """Test POST /api/answer with history as array."""
-    base_url = (os.getenv("RAG_BASE_URL") or "http://localhost:8000").rstrip("/")
+    base_url = get_base_url()
     
     try:
         resp = requests.get(f"{base_url}/health", timeout=2)
@@ -137,7 +139,7 @@ def test_api_answer_with_history_array():
 @pytest.mark.integration
 def test_stream_endpoint():
     """Test POST /stream endpoint (SSE)."""
-    base_url = (os.getenv("RAG_BASE_URL") or "http://localhost:8000").rstrip("/")
+    base_url = get_base_url()
     
     try:
         resp = requests.get(f"{base_url}/health", timeout=2)
@@ -192,7 +194,7 @@ def test_stream_endpoint():
 @pytest.mark.integration
 def test_api_answer_conversation_id():
     """Test POST /api/answer with conversation_id (should reuse or create)."""
-    base_url = (os.getenv("RAG_BASE_URL") or "http://localhost:8000").rstrip("/")
+    base_url = get_base_url()
     
     try:
         resp = requests.get(f"{base_url}/health", timeout=2)

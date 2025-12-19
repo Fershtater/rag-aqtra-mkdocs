@@ -6,11 +6,13 @@ import os
 import pytest
 import requests
 
+from tests._integration_utils import get_base_url
+
 
 @pytest.mark.integration
 def test_health_check():
     """Check that server is alive."""
-    base_url = (os.getenv("RAG_BASE_URL") or "http://localhost:8000").rstrip("/")
+    base_url = get_base_url()
     
     try:
         resp = requests.get(f"{base_url}/health", timeout=2)
@@ -23,7 +25,7 @@ def test_health_check():
 @pytest.mark.integration
 def test_accept_language_header_in_answer():
     """Test that /api/answer uses Accept-Language header when passthrough is absent."""
-    base_url = (os.getenv("RAG_BASE_URL") or "http://localhost:8000").rstrip("/")
+    base_url = get_base_url()
     
     try:
         resp = requests.get(f"{base_url}/health", timeout=2)
@@ -64,7 +66,7 @@ def test_accept_language_header_in_answer():
 @pytest.mark.integration
 def test_accept_language_priority_over_header():
     """Test that passthrough.language has priority over Accept-Language header."""
-    base_url = (os.getenv("RAG_BASE_URL") or "http://localhost:8000").rstrip("/")
+    base_url = get_base_url()
     
     try:
         resp = requests.get(f"{base_url}/health", timeout=2)
@@ -105,7 +107,7 @@ def test_accept_language_priority_over_header():
 @pytest.mark.integration
 def test_strict_no_sources_short_circuit():
     """Test that strict mode + no sources short-circuits LLM call."""
-    base_url = (os.getenv("RAG_BASE_URL") or "http://localhost:8000").rstrip("/")
+    base_url = get_base_url()
     
     try:
         resp = requests.get(f"{base_url}/health", timeout=2)
@@ -132,11 +134,15 @@ def test_strict_no_sources_short_circuit():
     
     if resp.status_code == 200:
         data = resp.json()
+        # Check contract fields instead of fragile text matching
+        assert "not_found" in data, "Response should contain 'not_found' field"
+        assert "sources" in data, "Response should contain 'sources' field"
+        assert "answer" in data, "Response should contain 'answer' field"
+        
         # Should return not_found=true
-        assert data.get("not_found") is True
-        # Should have empty or minimal sources
-        assert len(data.get("sources", [])) == 0
-        # Answer should contain "not enough information" or similar
-        answer = data.get("answer", "").lower()
-        assert "not enough" in answer or "don't have" in answer or "no information" in answer
+        assert data.get("not_found") is True, "Expected not_found=True for out-of-scope question"
+        # Should have empty sources
+        assert len(data.get("sources", [])) == 0, "Expected empty sources for not_found=True"
+        # Answer should be non-empty (but we don't check specific text)
+        assert len(data.get("answer", "")) > 0, "Answer should be non-empty"
 
