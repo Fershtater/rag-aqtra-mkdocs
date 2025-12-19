@@ -7,7 +7,8 @@ import logging
 from typing import Dict, Optional
 from time import time
 
-from fastapi import APIRouter, Request, Header, JSONResponse, HTTPException
+from fastapi import APIRouter, Request, Header, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.responses import Response
 
 from app.core.rag_chain import (

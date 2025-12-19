@@ -3,7 +3,8 @@ V2 answer endpoint (DocsGPT-like).
 """
 
 import logging
-from fastapi import APIRouter, Request, JSONResponse
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 from app.api.schemas.v2 import AnswerRequest, AnswerResponse, ErrorResponseV2
 from app.core.prompt_config import load_prompt_settings_from_env

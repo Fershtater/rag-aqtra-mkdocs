@@ -3,7 +3,8 @@ Escalation endpoint to support service (Zoho Desk).
 """
 
 import logging
-from fastapi import APIRouter, Request, JSONResponse
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 from app.api.schemas import EscalateRequest, ErrorResponse
 from app.infra.rate_limit import escalate_limiter

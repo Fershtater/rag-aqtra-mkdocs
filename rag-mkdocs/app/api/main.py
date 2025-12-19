@@ -140,7 +140,7 @@ async def lifespan(app: FastAPI):
     from app.services.answer_service import AnswerService
     
     prompt_service = PromptService()
-    conversation_service = ConversationService(sessionmaker=None)  # Will be updated if DB available
+    conversation_service = ConversationService(db_sessionmaker=None)  # Will be updated if DB available
     answer_service = AnswerService(conversation_service, prompt_service)
     
     app.state.prompt_service = prompt_service
@@ -184,7 +184,7 @@ async def lifespan(app: FastAPI):
             db_sessionmaker = await init_db(settings.DATABASE_URL)
             app.state.db_sessionmaker = db_sessionmaker
             # Update conversation service with sessionmaker
-            app.state.conversation_service = ConversationService(sessionmaker=db_sessionmaker)
+            app.state.conversation_service = ConversationService(db_sessionmaker=db_sessionmaker)
             # Recreate answer service with updated conversation service
             app.state.answer_service = AnswerService(
                 app.state.conversation_service,

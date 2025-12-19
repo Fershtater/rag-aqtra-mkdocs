@@ -8,7 +8,8 @@ import os
 from time import time
 from typing import Optional
 
-from fastapi import APIRouter, Request, JSONResponse
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 from app.api.schemas import Query, QueryResponse, ErrorResponse
 from app.core.prompt_config import (

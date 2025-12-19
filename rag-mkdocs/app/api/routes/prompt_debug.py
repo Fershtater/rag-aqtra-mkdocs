@@ -5,7 +5,8 @@ Debug endpoint for prompt rendering.
 import asyncio
 import logging
 import os
-from fastapi import APIRouter, Request, JSONResponse
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 from app.api.schemas.v2 import AnswerRequest, ErrorResponseV2
 from app.core.prompt_config import (

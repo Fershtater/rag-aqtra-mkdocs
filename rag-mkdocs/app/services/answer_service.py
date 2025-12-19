@@ -317,7 +317,9 @@ class AnswerService:
         client_ip: str,
         user_agent: Optional[str] = None,
         accept_language_header: Optional[str] = None,
-        vectorstore=None
+        vectorstore=None,
+        index_version: Optional[str] = None,
+        endpoint_name: str = "unknown"
     ) -> AnswerResponse:
         """
         Process answer request (common logic for /api/answer and /stream).
@@ -331,6 +333,8 @@ class AnswerService:
             user_agent: User agent string
             accept_language_header: Accept-Language header
             vectorstore: Vectorstore instance (for short-circuit)
+            index_version: Index version string (for cache key)
+            endpoint_name: Endpoint name for metrics (e.g., "api/answer", "stream")
             
         Returns:
             AnswerResponse

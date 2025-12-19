@@ -276,8 +276,7 @@ poetry run pytest -q
 ```bash
 poetry run python scripts/regression_e2e.py \
   --base-url http://localhost:8000 \
-  --api-key YOUR_RAG_KEY \
-  --update-key YOUR_UPDATE_KEY
+  --update-key whk_Cu1uR1t1br8BDhGZQlfT4ISoNLXSqMk0
 ```
 
 ---

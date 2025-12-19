@@ -18,6 +18,8 @@ ENV/
 .env
 
 # IDE
+.artifacts/
+.cursor/
 .vscode/
 .idea/
 *.swp
