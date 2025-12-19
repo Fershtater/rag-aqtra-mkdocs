@@ -49,7 +49,12 @@ class LRUCache:
         Returns:
             Value or None if not found or expired
         """
+        # Log cache access (hash only, no sensitive data)
+        key_hash = hashlib.sha256(key.encode()).hexdigest()[:12]
+        cache_size = len(self.cache)
+        
         if key not in self.cache:
+            logger.debug(f"CACHE_GET hash={key_hash} hit=False size={cache_size}")
             return None
         
         value, timestamp = self.cache[key]
@@ -57,10 +62,12 @@ class LRUCache:
         # Check TTL
         if time.time() - timestamp > self.ttl_seconds:
             del self.cache[key]
+            logger.debug(f"CACHE_GET hash={key_hash} hit=False (expired) size={len(self.cache)}")
             return None
         
         # Move to end (LRU)
         self.cache.move_to_end(key)
+        logger.info(f"CACHE_GET hash={key_hash} hit=True size={cache_size}")
         return value
     
     def set(self, key: str, value: Any):
@@ -71,11 +78,17 @@ class LRUCache:
             key: Cache key
             value: Value to save
         """
+        # Log cache write (hash only, no sensitive data)
+        key_hash = hashlib.sha256(key.encode()).hexdigest()[:12]
+        size_before = len(self.cache)
+        
         # Remove old entries if limit reached
         while len(self.cache) >= self.max_size:
             self.cache.popitem(last=False)  # Remove oldest
         
         self.cache[key] = (value, time.time())
+        size_after = len(self.cache)
+        logger.info(f"CACHE_SET hash={key_hash} size_before={size_before} size_after={size_after}")
     
     def clear(self):
         """Clears cache."""

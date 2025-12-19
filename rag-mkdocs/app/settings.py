@@ -98,6 +98,14 @@ class Settings(BaseSettings):
     PROMPT_DEFAULT_TOP_K: int = Field(default=4, description="Default top K for retrieval")
     PROMPT_DEFAULT_MAX_TOKENS: int = Field(default=1200, description="Default max tokens for LLM")
     
+    # Latency budget settings
+    STREAM_FLUSH_EVERY_N_CHARS: int = Field(default=15, description="Flush streaming buffer every N characters after first token (0 = flush immediately, first token always flushed immediately)")
+    HISTORY_MAX_CHARS: int = Field(default=6000, description="Maximum characters in chat history for prompt")
+    HISTORY_MAX_MESSAGES: int = Field(default=20, description="Maximum number of messages in chat history")
+    STREAM_HISTORY_MAX_CHARS: int = Field(default=3000, description="Maximum characters in chat history for streaming prompt (more restrictive)")
+    STREAM_HISTORY_MAX_MESSAGES: int = Field(default=10, description="Maximum number of messages in chat history for streaming (more restrictive)")
+    STREAM_TOP_K: Optional[int] = Field(default=None, description="Top K for retrieval in streaming mode (overrides DEFAULT_TOP_K if set)")
+    
     # RAG behavior
     STRICT_SHORT_CIRCUIT: bool = Field(
         default=True,
@@ -106,6 +114,20 @@ class Settings(BaseSettings):
     NOT_FOUND_SCORE_THRESHOLD: float = Field(
         default=0.20,
         description="Score threshold for 'not found' detection"
+    )
+    
+    # Lexical overlap gate for strict mode
+    STRICT_LEXICAL_GATE_ENABLED: bool = Field(
+        default=True,
+        description="Enable lexical overlap gate in strict mode (requires keywords in document)"
+    )
+    STRICT_LEXICAL_MIN_HITS: int = Field(
+        default=1,
+        description="Minimum number of keyword hits required for document to pass lexical gate"
+    )
+    STRICT_LEXICAL_MIN_TOKEN_LEN: int = Field(
+        default=4,
+        description="Minimum token length for keywords in lexical gate"
     )
     RERANKING_ENABLED: bool = Field(
         default=False,

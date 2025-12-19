@@ -28,6 +28,15 @@ pydantic-settings = "^2.0.0"
 requests = "^2.31.0"
 prometheus-client = "^0.20.0"
 pytest = "^9.0.2"
+pytest-asyncio = "^0.23.0"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+    "asyncio: marks tests as async tests",
+    "offline: marks tests as offline tests (no network/API keys required)",
+    "online: marks tests as online tests (require running server)",
+]
 
 [build-system]
 requires = ["poetry-core"]

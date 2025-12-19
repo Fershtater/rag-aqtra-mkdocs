@@ -79,7 +79,12 @@ def load_mkdocs_documents(docs_path: str = "data/mkdocs_docs") -> List[Document]
             loaded_docs = loader.load()
             
             for doc in loaded_docs:
-                relative_path = md_file.relative_to(full_docs_path)
+                # Calculate relative path to docs_root (safe fallback if not in subpath)
+                try:
+                    relative_path = md_file.relative_to(full_docs_path)
+                except ValueError:
+                    # If file is not in docs_path subpath, use filename only
+                    relative_path = Path(md_file.name)
                 source_path = str(relative_path).replace("\\", "/")
                 doc.metadata["source"] = source_path
                 doc.metadata["filename"] = md_file.name
@@ -87,7 +92,12 @@ def load_mkdocs_documents(docs_path: str = "data/mkdocs_docs") -> List[Document]
                 doc.metadata["_original_text"] = doc.page_content
             
             documents.extend(loaded_docs)
-            logger.debug(f"Loaded: {md_file.relative_to(project_root)}")
+            # Safe logging: use relative to docs_path or filename
+            try:
+                log_path = md_file.relative_to(full_docs_path)
+            except ValueError:
+                log_path = Path(md_file.name)
+            logger.debug(f"Loaded: {log_path}")
             
         except Exception as e:
             logger.error(f"Error loading {md_file}: {e}")
@@ -202,7 +212,12 @@ def _compute_docs_hash(docs_path: str) -> str:
         SHA256 hash of all files as string
     """
     project_root = Path(__file__).parent.parent.parent
-    full_docs_path = project_root / docs_path
+    # Resolve docs_path: if relative, resolve against project_root; if absolute, use as-is
+    docs_path_resolved = Path(docs_path)
+    if not docs_path_resolved.is_absolute():
+        full_docs_path = (project_root / docs_path).resolve()
+    else:
+        full_docs_path = docs_path_resolved.resolve()
     
     if not full_docs_path.exists():
         return ""
@@ -212,11 +227,23 @@ def _compute_docs_hash(docs_path: str) -> str:
     
     for md_file in md_files:
         try:
+            # Read file content for hashing
             with open(md_file, 'rb') as f:
-                hasher.update(f.read())
-                # Also add path and modification time
-                hasher.update(str(md_file.relative_to(project_root)).encode())
-                hasher.update(str(md_file.stat().st_mtime).encode())
+                content = f.read()
+                hasher.update(content)
+            
+            # Use deterministic path: relative to docs_path if possible, otherwise filename only
+            # This ensures hash is stable across different tmp_path locations
+            try:
+                rel_path = md_file.relative_to(full_docs_path)
+                path_key = str(rel_path).replace("\\", "/")  # Normalize path separators
+            except ValueError:
+                # If not in subpath, use filename only (deterministic)
+                path_key = md_file.name
+            
+            hasher.update(path_key.encode('utf-8'))
+            # Include modification time for change detection
+            hasher.update(str(md_file.stat().st_mtime).encode())
         except Exception as e:
             logger.warning(f"Error hashing {md_file}: {e}")
             continue

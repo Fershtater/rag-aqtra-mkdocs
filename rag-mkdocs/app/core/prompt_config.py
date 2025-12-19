@@ -290,18 +290,20 @@ def is_jinja_mode() -> bool:
     return mode == "jinja"
 
 
-def get_prompt_template_content(settings: Optional[PromptSettings] = None) -> str:
+def get_prompt_template_content(settings: Optional[PromptSettings] = None, preset_override: Optional[str] = None) -> str:
     """
     Get prompt template content based on configuration.
     
     Priority:
     1. PROMPT_TEMPLATE (if set, Jinja2 string)
     2. PROMPT_TEMPLATE_PATH (if set, read file)
-    3. PROMPT_PRESET (if jinja mode, select from app/prompts/)
-    4. Legacy build_system_prompt() (default)
+    3. preset_override (if provided, select from app/prompts/)
+    4. PROMPT_PRESET (if jinja mode, select from app/prompts/)
+    5. Legacy build_system_prompt() (default)
     
     Args:
         settings: PromptSettings instance (if None, loaded from env)
+        preset_override: Override preset for this request ("strict", "support", "developer")
         
     Returns:
         Template string (Jinja2 or legacy)
@@ -339,8 +341,8 @@ def get_prompt_template_content(settings: Optional[PromptSettings] = None) -> st
             logger = logging.getLogger(__name__)
             logger.warning(f"Error reading PROMPT_TEMPLATE_PATH: {e}, trying preset")
     
-    # Try PROMPT_PRESET
-    preset = os.getenv("PROMPT_PRESET", "strict").lower()
+    # Try preset_override first, then PROMPT_PRESET
+    preset = preset_override.lower() if preset_override else os.getenv("PROMPT_PRESET", "strict").lower()
     prompt_dir = os.getenv("PROMPT_DIR", "app/prompts")
     
     # Map preset to filename
@@ -370,7 +372,7 @@ def get_prompt_template_content(settings: Optional[PromptSettings] = None) -> st
     else:
         import logging
         logger = logging.getLogger(__name__)
-        logger.warning(f"Unknown PROMPT_PRESET: {preset}, falling back to legacy")
+        logger.warning(f"Unknown preset: {preset}, falling back to legacy")
     
     # Fallback to legacy
     if settings is None:

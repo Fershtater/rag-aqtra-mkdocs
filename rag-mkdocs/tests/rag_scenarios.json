@@ -1,0 +1,42 @@
+[
+  {
+    "id": "label_en",
+    "description": "Detailed English question about Label UI component should be answered using Label docs",
+    "question": "How does the Label UI component work in Aqtra and when should I use it instead of plain text?",
+    "expectations": {
+      "must_contain": ["label"],
+      "must_not_contain": ["not found", "Information not found"],
+      "required_sources": ["app-development/ui-components/label"]
+    }
+  },
+  {
+    "id": "button_en",
+    "description": "English question about Button UI component behaviour and usage should be answered using Button docs",
+    "question": "What does the Button UI component do in Aqtra, and in which cases should I use a primary versus a secondary button?",
+    "expectations": {
+      "must_contain": ["button"],
+      "must_not_contain": [
+        "not found",
+        "Information not found",
+        "don't have enough information"
+      ],
+      "required_sources": ["app-development/ui-components/button"]
+    },
+    "preset": "developer"
+  },
+  {
+    "id": "negative_out_of_scope_en",
+    "description": "Out-of-scope English question should clearly indicate information is not found and not return any Aqtra docs sources",
+    "question": "How to deploy Aqtra on Mars?",
+    "expectations": {
+      "must_contain": [
+        "not found",
+        "don't have enough information",
+        "does not contain information"
+      ],
+      "must_not_contain": [],
+      "required_sources": []
+    },
+    "preset": "strict"
+  }
+]

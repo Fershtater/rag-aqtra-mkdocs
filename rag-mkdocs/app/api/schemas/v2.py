@@ -72,6 +72,10 @@ class AnswerRequest(BaseModel):
         description="Conversation history as JSON string or array of {prompt,answer} or {role,content}"
     )
     conversation_id: Optional[str] = Field(None, description="Conversation ID for history persistence")
+    preset: Optional[Literal["strict", "support", "developer"]] = Field(
+        None,
+        description="Override prompt preset for this request (strict/support/developer). If not set, uses server default."
+    )
     passthrough: Optional[Dict[str, Any]] = Field(None, description="Additional passthrough data")
     context_hint: Optional[ContextHint] = Field(None, description="Context hints")
     retrieval: Optional[RetrievalConfig] = Field(None, description="Retrieval configuration")
@@ -103,6 +107,13 @@ class MetricsPayload(BaseModel):
     cache_hit: bool
     retrieved_chunks: int
     model: Optional[str] = None
+    ttft_ms: Optional[int] = Field(None, description="Time to first token in milliseconds (for streaming)")
+    retrieval_ms: Optional[int] = Field(None, description="Time to retrieve documents in milliseconds")
+    prompt_render_ms: Optional[int] = Field(None, description="Time to render prompt in milliseconds")
+    llm_connect_ms: Optional[int] = Field(None, description="Time to connect to LLM and start streaming in milliseconds")
+    embed_query_ms: Optional[int] = Field(None, description="Time to compute query embedding in milliseconds")
+    vector_search_ms: Optional[int] = Field(None, description="Time for vector similarity search in milliseconds")
+    format_sources_ms: Optional[int] = Field(None, description="Time to format sources in milliseconds")
 
 
 class AnswerResponse(BaseModel):

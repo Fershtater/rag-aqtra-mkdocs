@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      run_smoke:
+        description: 'Run smoke tests (requires running server)'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'poetry'
+      
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: latest
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+      
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+      
+      - name: Run pytest
+        run: poetry run pytest -q
+        env:
+          # Ensure tests run without OpenAI keys
+          OPENAI_API_KEY: ""
+          # Use test fixtures for docs
+          DOCS_PATH: tests/fixtures/docs
+          VECTORSTORE_DIR: var/vectorstore/faiss_index_ci
+          # Disable cache for tests
+          CACHE_TTL_SECONDS: "0"
+          # Use strict mode by default
+          PROMPT_PRESET: "strict"
+          # Enable lexical gate for strict mode
+          STRICT_LEXICAL_GATE_ENABLED: "true"
+          STRICT_LEXICAL_MIN_HITS: "1"
+          STRICT_LEXICAL_MIN_TOKEN_LEN: "4"
+
+  smoke:
+    name: Smoke Tests
+    runs-on: ubuntu-latest
+    # Only run if explicitly requested or if RUN_SMOKE secret is set
+    if: |
+      github.event_name == 'workflow_dispatch' && github.event.inputs.run_smoke == 'true' ||
+      github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.RUN_SMOKE == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'poetry'
+      
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: latest
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+      
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+      
+      - name: Build test index
+        run: |
+          poetry run python scripts/update_index.py \
+            --docs-path tests/fixtures/docs \
+            --vectorstore-dir var/vectorstore/faiss_index_ci
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DOCS_PATH: tests/fixtures/docs
+          VECTORSTORE_DIR: var/vectorstore/faiss_index_ci
+        continue-on-error: true
+      
+      - name: Start server
+        run: |
+          poetry run uvicorn app.api.main:app \
+            --host 127.0.0.1 \
+            --port 8000 \
+            --log-level info &
+          echo $! > server.pid
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DOCS_PATH: tests/fixtures/docs
+          VECTORSTORE_DIR: var/vectorstore/faiss_index_ci
+          RAG_API_KEYS: "devkey"
+          PROMPT_PRESET: "developer"
+          CACHE_TTL_SECONDS: "600"
+      
+      - name: Wait for server
+        run: |
+          for i in {1..30}; do
+            if curl -f http://127.0.0.1:8000/health > /dev/null 2>&1; then
+              echo "Server is ready"
+              exit 0
+            fi
+            echo "Waiting for server... ($i/30)"
+            sleep 2
+          done
+          echo "Server failed to start"
+          exit 1
+      
+      - name: Run smoke tests
+        run: |
+          poetry run python scripts/chat_smoke.py \
+            --base-url http://127.0.0.1:8000 \
+            --api-key devkey \
+            --run-twice
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f server.pid ]; then
+            kill $(cat server.pid) || true
+            rm server.pid
+          fi
+          pkill -f uvicorn || true
+

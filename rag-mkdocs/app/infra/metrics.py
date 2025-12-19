@@ -70,6 +70,24 @@ if PROMETHEUS_AVAILABLE:
         buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
     )
     
+    rag_ttft_seconds = Histogram(
+        'rag_ttft_seconds',
+        'Time to first token (TTFT) in seconds',
+        ['endpoint'],
+        buckets=[0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0]
+    )
+    
+    # Embedding cache metrics
+    rag_embedding_cache_hits_total = Counter(
+        'rag_embedding_cache_hits_total',
+        'Total number of embedding cache hits'
+    )
+    
+    rag_embedding_cache_misses_total = Counter(
+        'rag_embedding_cache_misses_total',
+        'Total number of embedding cache misses'
+    )
+    
     # Gauges
     documents_in_index = Gauge(
         'rag_documents_in_index',
@@ -90,6 +108,9 @@ else:
     rag_retrieval_latency_seconds = None
     rag_prompt_render_latency_seconds = None
     rag_llm_latency_seconds = None
+    rag_ttft_seconds = None
+    rag_embedding_cache_hits_total = None
+    rag_embedding_cache_misses_total = None
     documents_in_index = None
     chunks_in_index = None
 

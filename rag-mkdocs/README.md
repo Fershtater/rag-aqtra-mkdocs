@@ -1152,6 +1152,80 @@ poetry run python scripts/regression_e2e.py \
 - Summary with total passed/failed
 - Exit code 0 if all pass, 1 if any fail
 
+### Online Smoke Tests
+
+**Chat smoke test script** (`scripts/chat_smoke.py`):
+
+- Simulates a real chat conversation with 3 questions
+- Tests `/api/answer` and `/stream` endpoints with conversation persistence
+- Validates Accept-Language header support
+- Tests cache hits on repeated runs
+- Tests strict mode short-circuit for no sources (with `preset="strict"`)
+
+**Usage:**
+
+```bash
+# Start server first
+poetry run uvicorn app.api.main:app --reload --port 8000
+
+# Basic test (3 questions)
+poetry run python scripts/chat_smoke.py --base-url http://localhost:8000 --api-key devkey
+
+# With Accept-Language header
+poetry run python scripts/chat_smoke.py --base-url http://localhost:8000 --api-key devkey --accept-language fr-FR
+
+# With double run (cache test)
+poetry run python scripts/chat_smoke.py --base-url http://localhost:8000 --api-key devkey --run-twice
+
+# With strict miss question
+poetry run python scripts/chat_smoke.py --base-url http://localhost:8000 --api-key devkey --strict-miss-question "How do I configure the quantum flux capacitor in Aqtra?"
+```
+
+**What it tests:**
+
+- ✅ `/api/answer` endpoint with conversation_id persistence
+- ✅ `/stream` endpoint (SSE) with correct event order
+- ✅ Accept-Language header selection (via `/api/prompt/render`)
+- ✅ Cache hits on repeated runs (if cache enabled)
+- ✅ Strict mode short-circuit when no sources found
+
+**Note:** Swagger UI may complain about history as JSON string format. For reliable testing, use `chat_smoke.py` or manual curl scripts.
+
+### CI/CD
+
+**GitHub Actions Workflow:** `.github/workflows/ci.yml`
+
+The CI pipeline includes two jobs:
+
+1. **`tests`** (required, runs on every PR):
+
+   - Runs `pytest -q` with mocked LLM/embeddings
+   - No OpenAI API key required
+   - Fast execution (< 1 minute)
+   - Uses test fixtures from `tests/fixtures/docs/`
+
+2. **`smoke`** (optional, manual trigger):
+   - Runs only when explicitly requested via `workflow_dispatch` with `run_smoke=true`
+   - Or when `RUN_SMOKE` secret is set to `"true"` on main branch
+   - Requires `OPENAI_API_KEY` secret in GitHub repository settings
+   - Starts server, waits for health check, runs `chat_smoke.py`
+   - Uses test fixtures from `tests/fixtures/docs/`
+
+**Why smoke tests are optional:**
+
+- Require OpenAI API key (costs money)
+- Require running server (slower execution)
+- Should not block PR merges
+- Useful for pre-release validation
+
+**Manual trigger:**
+
+1. Go to GitHub Actions → CI → Run workflow
+2. Check "Run smoke tests"
+3. Click "Run workflow"
+
+For more details, see [docs/TESTING.md](docs/TESTING.md).
+
 ### RAG Regression Scenarios
 
 Legacy regression scenarios (`tests/rag_scenarios.json`) focus on **invariants**:
