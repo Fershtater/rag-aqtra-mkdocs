@@ -386,9 +386,9 @@ def build_or_load_vectorstore(
             embeddings = get_embeddings_client()
             
             vectorstore = FAISS.load_local(
-                str(full_index_path),
+                index_path,
                 embeddings,
-                allow_dangerous_deserialization=is_dev
+                allow_dangerous_deserialization=True
             )
             
             # Load and log index version
@@ -442,9 +442,9 @@ def build_or_load_vectorstore(
                         lock.release()
                         embeddings = get_embeddings_client()
                         vectorstore = FAISS.load_local(
-                            str(full_index_path),
+                            index_path,
                             embeddings,
-                            allow_dangerous_deserialization=is_dev
+                            allow_dangerous_deserialization=True,
                         )
                         index_version = get_index_version(index_path)
                         if index_version:

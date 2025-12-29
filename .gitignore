@@ -32,7 +32,6 @@ site/
 
 # local runtime data / artifacts
 var/
-data/mkdocs_docs/
 .artifacts/
 logs/
 *.log
