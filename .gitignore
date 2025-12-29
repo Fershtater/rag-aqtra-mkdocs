@@ -1,0 +1,56 @@
+# tests
+tests/
+
+# python caches
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# env
+.env
+.env.*
+.venv/
+venv/
+env/
+ENV/
+
+# build artifacts
+build/
+dist/
+*.egg-info/
+
+# mkdocs output
+site/
+
+# local runtime data / artifacts
+var/
+data/mkdocs_docs/
+.artifacts/
+logs/
+*.log
+*.zip
+app/vectorstore/
+**/faiss_index/
+**/*.faiss
+**/*.pkl
+vectorstore/
+
+# IDE
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
