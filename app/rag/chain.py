@@ -40,7 +40,7 @@ def build_rag_chain(
     vectorstore,
     prompt_settings: Optional[PromptSettings] = None,
     k: Optional[int] = None,
-    model: str = "gpt-4o",
+    model: str = "gpt-4o-mini",
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None
 ):
@@ -53,7 +53,7 @@ def build_rag_chain(
         vectorstore: Ready FAISS vectorstore
         prompt_settings: Prompt settings (if None, loaded from environment)
         k: Number of relevant chunks (if None, used from prompt_settings)
-        model: OpenAI model (default "gpt-4o")
+        model: OpenAI model (default "gpt-4o-mini")
         temperature: Generation temperature (if None, used from prompt_settings)
         max_tokens: Maximum number of tokens (optional)
         

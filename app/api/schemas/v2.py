@@ -141,7 +141,7 @@ class AnswerResponse(BaseModel):
                     "latency_ms": 1234,
                     "cache_hit": False,
                     "retrieved_chunks": 4,
-                    "model": "gpt-4o"
+                    "model": "gpt-4o-mini"
                 }
             }
         }

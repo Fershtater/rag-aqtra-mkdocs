@@ -23,7 +23,7 @@ RERANKING_ENABLED = os.getenv("RERANKING_ENABLED", "0").lower() in ("1", "true",
 def build_retriever(
     vectorstore,
     k: int,
-    model: str = "gpt-4o",
+    model: str = "gpt-4o-mini",
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None
 ):
