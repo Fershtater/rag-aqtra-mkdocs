@@ -1,18 +1,19 @@
 """
-Optional script for updating vector index.
+Script for updating vector index.
 
 Usage:
-    python update_index.py
+    python scripts/update_index.py [--docs-path PATH] [--vectorstore-dir PATH]
 
 This script:
-1. Loads all .md files from data/mkdocs_docs
+1. Loads all .md files from docs path
 2. Splits them into chunks
 3. Recreates FAISS vector index
-4. Saves index to vectorstore/faiss_index
+4. Saves index to vectorstore directory
 
 Alternative: use /update_index endpoint via API.
 """
 
+import argparse
 import logging
 import sys
 from pathlib import Path
@@ -22,7 +23,8 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from dotenv import load_dotenv
-from app.core.rag_chain import build_or_load_vectorstore, chunk_documents, load_mkdocs_documents
+from app.rag.indexing import build_or_load_vectorstore, load_mkdocs_documents
+from app.settings import Settings
 
 # Configure logging
 logging.basicConfig(
@@ -37,38 +39,60 @@ def main():
     # Load environment variables
     load_dotenv()
     
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Update FAISS vector index from documentation")
+    parser.add_argument(
+        "--docs-path",
+        type=str,
+        help="Path to documentation directory (default: from Settings.DOCS_PATH)"
+    )
+    parser.add_argument(
+        "--vectorstore-dir",
+        type=str,
+        help="Path to vectorstore directory (default: from Settings.VECTORSTORE_DIR)"
+    )
+    args = parser.parse_args()
+    
+    # Get settings
+    settings = Settings()
+    
+    # Use provided paths or fall back to settings
+    docs_path = args.docs_path or settings.DOCS_PATH
+    vectorstore_dir = args.vectorstore_dir or settings.VECTORSTORE_DIR
+    
     logger.info("=" * 60)
     logger.info("UPDATING VECTOR INDEX")
     logger.info("=" * 60)
+    logger.info(f"Docs path: {docs_path}")
+    logger.info(f"Vectorstore dir: {vectorstore_dir}")
     
     try:
         # Load documents
-        logger.info("Loading documents from data/mkdocs_docs...")
-        documents = load_mkdocs_documents()
+        logger.info(f"Loading documents from {docs_path}...")
+        documents = load_mkdocs_documents(docs_path=docs_path)
         
         if not documents:
-            logger.error("No documents found for indexing")
-            logger.error("Make sure data/mkdocs_docs contains .md files")
+            logger.error(f"No documents found for indexing in {docs_path}")
+            logger.error("Make sure the docs path contains .md files")
             sys.exit(1)
         
         logger.info(f"Loaded {len(documents)} documents")
         
-        # Split into chunks
-        logger.info("Splitting documents into chunks...")
-        chunks = chunk_documents(documents)
-        logger.info(f"Created {len(chunks)} chunks")
-        
-        # Recreate index
-        logger.info("Creating vector index...")
+        # Build index (force rebuild)
+        logger.info(f"Creating vector index in {vectorstore_dir}...")
         vectorstore = build_or_load_vectorstore(
-            chunks=chunks,
+            chunks=None,  # Will auto-load from docs_path
+            index_path=vectorstore_dir,
+            docs_path=docs_path,
             force_rebuild=True
         )
         
         logger.info("=" * 60)
         logger.info("Index successfully updated!")
-        logger.info(f"Number of documents in index: {vectorstore.index.ntotal}")
-        logger.info(f"Vector dimension: {vectorstore.index.d}")
+        if hasattr(vectorstore, 'index') and hasattr(vectorstore.index, 'ntotal'):
+            logger.info(f"Number of documents in index: {vectorstore.index.ntotal}")
+            if hasattr(vectorstore.index, 'd'):
+                logger.info(f"Vector dimension: {vectorstore.index.d}")
         logger.info("=" * 60)
         
     except Exception as e:

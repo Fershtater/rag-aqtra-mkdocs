@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "rag-mkdocs"
+name = "rag-aqtra-mkdocs"
 version = "1.0.0"
 description = "RAG assistant for MkDocs documentation"
 authors = ["Your Name <you@example.com>"]

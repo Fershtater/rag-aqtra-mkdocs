@@ -19,11 +19,15 @@ class IndexLock:
         Initialize lock.
         
         Args:
-            index_path: Path to index directory
+            index_path: Path to index directory (can be absolute or relative)
             timeout_seconds: Lock timeout in seconds
         """
-        project_root = Path(__file__).parent.parent.parent
-        full_index_path = project_root / index_path
+        index_path_resolved = Path(index_path)
+        if not index_path_resolved.is_absolute():
+            project_root = Path(__file__).parent.parent.parent
+            full_index_path = (project_root / index_path).resolve()
+        else:
+            full_index_path = index_path_resolved.resolve()
         self.lock_file = full_index_path.parent / f"{full_index_path.name}.lock"
         self.timeout_seconds = timeout_seconds
         self.lock_fd: Optional[int] = None

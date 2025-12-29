@@ -1075,6 +1075,111 @@ ESCALATE_RATE_WINDOW_SECONDS=3600
 
 ---
 
+## Deploy to Railway (FAISS + Volume)
+
+This repository is configured for deployment on [Railway](https://railway.app/) with persistent FAISS index storage using a mounted volume.
+
+**Deployment Strategy:**
+
+- Documentation files are bundled in the Docker image at `data/mkdocs_docs` (no volume needed for docs)
+- FAISS index is stored in a Railway Volume mounted at `/data` (persists across deploys)
+
+### Setup Checklist
+
+1. **Create a Volume in Railway:**
+
+   - In your Railway project, create a new Volume
+   - Mount it at `/data` (this path is used for the FAISS index)
+
+2. **Configure Environment Variables:**
+
+   Set the following environment variables in Railway:
+
+   ```env
+   VECTORSTORE_DIR=/data/vectorstore/faiss_index
+   DOCS_PATH=data/mkdocs_docs
+   OPENAI_API_KEY=your-openai-key-here
+   UPDATE_API_KEY=your-update-key-here
+   ENV=production
+   PORT=8000  # Railway sets this automatically, but you can override
+   ```
+
+   **Important Notes:**
+
+   - `DOCS_PATH` should be `data/mkdocs_docs` (docs come from the Docker image)
+   - Do NOT point `DOCS_PATH` to `/data/docs` unless you also copy documentation files to the volume
+   - `VECTORSTORE_DIR` must point to `/data/vectorstore/faiss_index` (inside the mounted volume)
+
+3. **Deploy:**
+
+   The `Procfile` is already configured:
+
+   ```
+   web: bash scripts/railway_start.sh
+   ```
+
+   Railway will automatically:
+
+   - Run the startup script on each deploy
+   - Verify that documentation files exist in the image
+   - Check if the FAISS index exists in the volume
+   - Build the index automatically if it's missing (first deploy or after volume reset)
+   - Start the API server
+
+### First Deploy
+
+On the first deploy (or if the volume is empty), the startup script will:
+
+1. Verify that `data/mkdocs_docs` exists and contains `.md` files (from the Docker image)
+2. Create the vectorstore directory structure in the volume (`/data/vectorstore/faiss_index`)
+3. Detect that the index is missing in the volume
+4. Run `scripts/update_index.py` to build the index from `DOCS_PATH` (image) into `VECTORSTORE_DIR` (volume)
+5. This may take several minutes depending on documentation size
+6. Start the API server
+
+**Expected logs:**
+
+```
+[railway] boot
+[railway] VECTORSTORE_DIR=/data/vectorstore/faiss_index
+[railway] DOCS_PATH=data/mkdocs_docs
+[railway] docs directory verified: X .md files found
+[railway] index not found in /data/vectorstore/faiss_index
+[railway] building index...
+[railway] starting api...
+```
+
+### Subsequent Deploys
+
+On subsequent deploys:
+
+- The index persists in the mounted volume (`/data/vectorstore/faiss_index`)
+- The startup script detects the existing index
+- The API starts immediately (no rebuild needed)
+- The index only rebuilds if you manually trigger it or if the volume is reset
+
+**Expected logs:**
+
+```
+[railway] boot
+[railway] VECTORSTORE_DIR=/data/vectorstore/faiss_index
+[railway] DOCS_PATH=data/mkdocs_docs
+[railway] docs directory verified: X .md files found
+[railway] index found in /data/vectorstore/faiss_index
+[railway] starting api...
+```
+
+### Local Development
+
+The Railway configuration does not affect local development. Locally, the service uses:
+
+- `VECTORSTORE_DIR=var/vectorstore/faiss_index` (default)
+- `DOCS_PATH=data/mkdocs_docs` (default)
+
+You can override these via environment variables or `.env` file as usual. The service works fine without `/data` volume (which is Railway-specific).
+
+---
+
 ## Testing
 
 The repository includes multiple testing strategies: **offline unit tests** (no OpenAI key required) and **online E2E tests** (against live server).

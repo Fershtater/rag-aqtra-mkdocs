@@ -256,11 +256,15 @@ def _save_index_hash(index_path: str, docs_hash: str) -> None:
     Saves document hash to file for staleness checking.
     
     Args:
-        index_path: Path to index directory
+        index_path: Path to index directory (can be absolute or relative)
         docs_hash: SHA256 hash of documents
     """
-    project_root = Path(__file__).parent.parent.parent
-    full_index_path = project_root / index_path
+    index_path_resolved = Path(index_path)
+    if not index_path_resolved.is_absolute():
+        project_root = Path(__file__).parent.parent.parent
+        full_index_path = (project_root / index_path).resolve()
+    else:
+        full_index_path = index_path_resolved.resolve()
     hash_file = full_index_path / ".docs_hash"
     
     try:
@@ -277,13 +281,17 @@ def _load_index_hash(index_path: str) -> Optional[str]:
     Loads document hash from file.
     
     Args:
-        index_path: Path to index directory
+        index_path: Path to index directory (can be absolute or relative)
         
     Returns:
         SHA256 hash string or None if not found
     """
-    project_root = Path(__file__).parent.parent.parent
-    full_index_path = project_root / index_path
+    index_path_resolved = Path(index_path)
+    if not index_path_resolved.is_absolute():
+        project_root = Path(__file__).parent.parent.parent
+        full_index_path = (project_root / index_path).resolve()
+    else:
+        full_index_path = index_path_resolved.resolve()
     hash_file = full_index_path / ".docs_hash"
     
     if not hash_file.exists():
@@ -347,8 +355,13 @@ def build_or_load_vectorstore(
     if index_path is None:
         index_path = get_vectorstore_dir()
     
-    project_root = Path(__file__).parent.parent.parent
-    full_index_path = project_root / index_path
+    # Resolve index_path: if relative, resolve against project_root; if absolute, use as-is
+    index_path_resolved = Path(index_path)
+    if not index_path_resolved.is_absolute():
+        project_root = Path(__file__).parent.parent.parent
+        full_index_path = (project_root / index_path).resolve()
+    else:
+        full_index_path = index_path_resolved.resolve()
     
     index_exists = full_index_path.exists() and any(full_index_path.iterdir())
     
@@ -461,8 +474,19 @@ def build_or_load_vectorstore(
             logger.info(f"Building index version: {index_version}")
             
             # Create temporary directory for atomic rebuild
-            tmp_index_path = f"{index_path}.tmp-{uuid.uuid4().hex[:8]}"
-            tmp_full_index_path = project_root / tmp_index_path
+            # Use parent directory of index_path for tmp (to keep them together)
+            index_path_resolved = Path(index_path)
+            if index_path_resolved.is_absolute():
+                tmp_index_path = str(index_path_resolved.parent / f"{index_path_resolved.name}.tmp-{uuid.uuid4().hex[:8]}")
+            else:
+                project_root = Path(__file__).parent.parent.parent
+                tmp_index_path = f"{index_path}.tmp-{uuid.uuid4().hex[:8]}"
+            tmp_index_path_resolved = Path(tmp_index_path)
+            if tmp_index_path_resolved.is_absolute():
+                tmp_full_index_path = tmp_index_path_resolved
+            else:
+                project_root = Path(__file__).parent.parent.parent
+                tmp_full_index_path = (project_root / tmp_index_path).resolve()
             
             logger.info("Creating temporary index in %s...", tmp_index_path)
             
@@ -505,7 +529,11 @@ def build_or_load_vectorstore(
             logger.info("Performing atomic swap...")
             
             # Remove old backup if exists (keep only one backup)
-            backup_path = project_root / f"{index_path}.bak"
+            if full_index_path.is_absolute():
+                backup_path = full_index_path.parent / f"{full_index_path.name}.bak"
+            else:
+                project_root = Path(__file__).parent.parent.parent
+                backup_path = project_root / f"{index_path}.bak"
             if backup_path.exists():
                 import shutil
                 try:
