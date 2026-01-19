@@ -1075,6 +1075,88 @@ ESCALATE_RATE_WINDOW_SECONDS=3600
 
 ---
 
+## Zoho SalesIQ OAuth Integration
+
+The service provides OAuth "authorization code" flow endpoints for Zoho SalesIQ integration.
+
+### Endpoints
+
+**`GET /oauth/start`**
+
+Generates a state token and returns an authorization URL. Start the OAuth flow by redirecting users to the `authorization_url`.
+
+**Response:**
+```json
+{
+  "state": "random-state-token...",
+  "authorization_url": "https://accounts.zoho.com/oauth/v2/auth?..."
+}
+```
+
+**`GET /oauth/callback`**
+
+OAuth callback endpoint that accepts the authorization code, exchanges it for tokens, and stores them securely.
+
+**Query Parameters:**
+- `code` (required): Authorization code from Zoho
+- `state` (required): State token for CSRF protection
+- `location` (optional): Zoho location/DC (e.g., 'eu', 'com', 'in')
+
+**Response:**
+- `200`: HTML success page ("OK, you can close this tab")
+- `400`: Missing or invalid `code`/`state` parameters
+- `502`: Error exchanging code for tokens
+- `503`: OAuth not configured
+
+### Configuration
+
+**Required environment variables:**
+
+```env
+# Zoho OAuth credentials
+ZOHO_CLIENT_ID=your-client-id
+ZOHO_CLIENT_SECRET=your-client-secret
+
+# OAuth redirect URI (must match Zoho app configuration)
+ZOHO_REDIRECT_URI=https://agent.aqtra.io/oauth/callback
+
+# Default Zoho Accounts base URL (used if location not provided)
+ZOHO_ACCOUNTS_BASE_URL=https://accounts.zoho.com
+
+# OAuth scopes (comma-separated)
+ZOHO_SCOPES=SalesIQ.tickets.READ,SalesIQ.tickets.WRITE
+```
+
+**Optional environment variables:**
+- `ZOHO_REDIRECT_URI`: Defaults to `https://agent.aqtra.io/oauth/callback`
+- `ZOHO_ACCOUNTS_BASE_URL`: Defaults to `https://accounts.zoho.com`
+- `ZOHO_SCOPES`: Defaults to `SalesIQ.tickets.READ,SalesIQ.tickets.WRITE` if not set
+
+### How it works
+
+1. **State Generation**: `/oauth/start` generates a cryptographically secure state token (32+ characters) and stores it server-side with a 10-minute TTL
+2. **Authorization**: User is redirected to Zoho's authorization URL with the state token
+3. **Callback**: Zoho redirects to `/oauth/callback` with `code`, `state`, and optionally `location` (DC)
+4. **State Validation**: Server validates the state token (CSRF protection) and consumes it (one-time use)
+5. **Token Exchange**: Authorization code is exchanged for `access_token` and `refresh_token` via POST to `{accounts-server}/oauth/v2/token`
+6. **DC Handling**: If `location` is provided, the correct Zoho Accounts domain is selected (e.g., `accounts.zoho.eu` for EU)
+7. **Token Storage**: Tokens are stored in-memory with LRU eviction and TTL (access tokens are refreshed 60s before expiry)
+
+### Security
+
+- **CSRF Protection**: State tokens are validated and consumed (one-time use) with 10-minute TTL
+- **Secret Masking**: `client_secret` and `refresh_token` are never logged
+- **Secure Storage**: Tokens stored in-memory only (no persistence to disk/database)
+- **HTTPS Required**: OAuth callback should only be used over HTTPS in production
+
+### Token Management
+
+Access tokens are automatically refreshed using the refresh token when they expire or are near expiry (60s buffer). Use the `refresh_access_token()` function in `app/services/zoho_oauth.py` to refresh tokens programmatically.
+
+**Note:** The `/query` endpoint remains unchanged and is not involved in OAuth flows.
+
+---
+
 ## Deploy to Railway (FAISS + Volume)
 
 This repository is configured for deployment on [Railway](https://railway.app/) with persistent FAISS index storage using a mounted volume.

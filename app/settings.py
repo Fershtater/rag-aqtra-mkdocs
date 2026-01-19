@@ -172,6 +172,20 @@ class Settings(BaseSettings):
     ZOHO_REFRESH_TOKEN: Optional[str] = Field(default=None, description="Zoho Desk refresh token")
     ZOHO_ORG_ID: Optional[str] = Field(default=None, description="Zoho Desk organization ID")
     
+    # Zoho OAuth (for SalesIQ OAuth flow)
+    ZOHO_REDIRECT_URI: Optional[str] = Field(
+        default="https://agent.aqtra.io/oauth/callback",
+        description="OAuth redirect URI"
+    )
+    ZOHO_ACCOUNTS_BASE_URL: Optional[str] = Field(
+        default="https://accounts.zoho.com",
+        description="Zoho Accounts base URL (default DC)"
+    )
+    ZOHO_SCOPES: Optional[str] = Field(
+        default=None,
+        description="OAuth scopes (comma-separated, e.g., 'SalesIQ.tickets.READ,SalesIQ.tickets.WRITE')"
+    )
+    
     @field_validator("PROMPT_DEFAULT_TEMPERATURE")
     @classmethod
     def validate_temperature(cls, v: float) -> float:

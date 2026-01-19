@@ -63,6 +63,7 @@ from app.api.routes import (
     prompt_debug,
     admin_index,
     escalate,
+    zoho_oauth,
 )
 
 # Configure logging (will be updated after settings load)
@@ -281,6 +282,7 @@ app.include_router(stream.router)
 app.include_router(prompt_debug.router)
 app.include_router(admin_index.router)
 app.include_router(escalate.router)
+app.include_router(zoho_oauth.router)
 
 
 @app.get("/config/prompt")
